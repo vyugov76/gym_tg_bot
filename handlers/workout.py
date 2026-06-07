@@ -1,5 +1,7 @@
 """Логика записи тренировки: упражнения, подходы, расчёт тоннажа."""
 
+import re
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -15,6 +17,40 @@ from keyboards.menu import (
 from states.workout_states import WorkoutStates
 
 router = Router(name="workout")
+
+SET_INPUT_PATTERN = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+)\s*$")
+
+INVALID_FORMAT_MSG = (
+    "Некорректный формат. Пожалуйста, введите данные в формате "
+    "ВЕС/ПОВТОРЕНИЯ (например, 80/10):"
+)
+
+
+def _set_prompt(exercise_name: str, set_number: int) -> str:
+    """Текст запроса подхода в едином формате вес/повторения."""
+    return (
+        f"Упражнение: <b>{exercise_name}</b>\n"
+        f"Подход {set_number} — введите <b>вес/повторения</b> "
+        f"(например, 60/10):"
+    )
+
+
+def parse_set_input(text: str | None) -> tuple[float, int] | None:
+    """Парсит строку «вес/повторения». Возвращает None при некорректном вводе."""
+    if not text:
+        return None
+
+    match = SET_INPUT_PATTERN.match(text)
+    if not match:
+        return None
+
+    weight = float(match.group(1).replace(",", "."))
+    reps = int(match.group(2))
+
+    if weight < 0 or weight > 500 or reps <= 0 or reps > 100:
+        return None
+
+    return weight, reps
 
 
 async def _require_user(message: Message) -> dict | None:
@@ -99,12 +135,9 @@ async def choose_exercise(callback: CallbackQuery, state: FSMContext) -> None:
         exercise_name=exercise_name,
         set_number=1,
     )
-    await state.set_state(WorkoutStates.entering_weight)
+    await state.set_state(WorkoutStates.entering_set)
 
-    await callback.message.edit_text(
-        f"Упражнение: <b>{exercise_name}</b>\n"
-        f"Подход 1 — введите <b>вес</b> в кг (например, 60):"
-    )
+    await callback.message.edit_text(_set_prompt(exercise_name, 1))
     await callback.answer()
 
 
@@ -121,61 +154,40 @@ async def next_exercise(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "set:more")
 async def add_more_set(callback: CallbackQuery, state: FSMContext) -> None:
-    """Запрос веса для следующего подхода того же упражнения."""
+    """Запрос следующего подхода того же упражнения."""
     data = await state.get_data()
     set_number = data.get("set_number", 1)
 
-    await state.set_state(WorkoutStates.entering_weight)
-    await callback.message.edit_text(
-        f"Упражнение: <b>{data['exercise_name']}</b>\n"
-        f"Подход {set_number} — введите <b>вес</b> в кг:"
-    )
+    await state.set_state(WorkoutStates.entering_set)
+    await callback.message.answer(_set_prompt(data["exercise_name"], set_number))
     await callback.answer()
 
 
-@router.message(WorkoutStates.entering_weight)
-async def process_weight(message: Message, state: FSMContext) -> None:
-    """Принимает вес подхода и запрашивает повторения."""
-    try:
-        weight = float(message.text.replace(",", "."))
-        if weight < 0 or weight > 500:
-            raise ValueError
-    except (ValueError, AttributeError):
-        await message.answer("Введите корректный вес числом (0–500 кг):")
+@router.message(WorkoutStates.entering_set)
+async def process_set(message: Message, state: FSMContext) -> None:
+    """Принимает подход в формате вес/повторения и сохраняет его в БД."""
+    parsed = parse_set_input(message.text)
+    if parsed is None:
+        await message.answer(INVALID_FORMAT_MSG)
         return
 
-    await state.update_data(current_weight=weight)
-    await state.set_state(WorkoutStates.entering_reps)
-    await message.answer("Теперь введите <b>количество повторений</b> (например, 10):")
-
-
-@router.message(WorkoutStates.entering_reps)
-async def process_reps(message: Message, state: FSMContext) -> None:
-    """Принимает повторения, сохраняет подход и предлагает следующие действия."""
-    try:
-        reps = int(message.text.strip())
-        if reps <= 0 or reps > 100:
-            raise ValueError
-    except (ValueError, AttributeError):
-        await message.answer("Введите целое число повторений от 1 до 100:")
-        return
-
+    weight, reps = parsed
     data = await state.get_data()
     set_number = data["set_number"]
 
     await db.add_set(
         workout_exercise_id=data["workout_exercise_id"],
         set_number=set_number,
-        weight=data["current_weight"],
+        weight=weight,
         reps=reps,
     )
 
-    tonnage = data["current_weight"] * reps
+    tonnage = weight * reps
     await state.update_data(set_number=set_number + 1)
 
     await message.answer(
         f"✅ Подход {set_number} записан: "
-        f"{data['current_weight']} кг × {reps} = {tonnage:.0f} кг\n\n"
+        f"{weight} кг × {reps} = {tonnage:.0f} кг\n\n"
         f"Что дальше?",
         reply_markup=after_set_keyboard(),
     )

@@ -2,29 +2,42 @@
 
 from __future__ import annotations
 
+import os  # <-- ОБЯЗАТЕЛЬНО ДОБАВЛЯЕМ ЭТОТ ИМПОРТ
 import aioodbc
+from dotenv import load_dotenv
 
-# Параметры подключения — замените на свои
-DB_CONFIG = {
-    "driver": "ODBC Driver 17 for SQL Server",
-    "server": "stud-mssql.sttec.yar.ru,38325",
-    "database": "user260_db",
-    "user": "user260_db",
-    "password": "user260",
-}
+# Находим путь к текущему файлу (connection.py)
+current_path = os.path.abspath(__file__)
+
+# Отсекаем всё, что идет после названия корневой папки проекта
+root_dir = current_path.split("gym_tg_bot")[0] + "gym_tg_bot"
+
+# Собираем идеальный абсолютный путь к .env
+env_path = os.path.join(root_dir, ".env")
+
+# Загружаем переменные окружения
+load_dotenv(dotenv_path=env_path)
+
+DB_DRIVER = os.getenv("DB_DRIVER", "ODBC Driver 17 for SQL Server")
+DB_SERVER = os.getenv("DB_SERVER", "localhost")
+DB_DATABASE = os.getenv("DB_DATABASE", "")
+DB_USER = os.getenv("DB_USER", "")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 # Глобальный пул соединений (создаётся при старте бота)
 _pool: aioodbc.Pool | None = None
 
+# ... дальше твои функции build_dsn(), init_db() и остальные идут без изменений ...
+
 
 def build_dsn() -> str:
-    """Формирует строку подключения ODBC для локального SQL Server."""
+    """Формирует строку подключения ODBC с авторизацией по логину и паролю."""
     return (
-        f"DRIVER={{{DB_CONFIG['driver']}}};"
-        f"SERVER={DB_CONFIG['server']};"
-        f"DATABASE={DB_CONFIG['database']};"
-        f"UID={DB_CONFIG['user']};"
-        f"PWD={DB_CONFIG['password']};"
+        f"DRIVER={{{DB_DRIVER}}};"
+        f"SERVER={DB_SERVER};"
+        f"DATABASE={DB_DATABASE};"
+        f"UID={DB_USER};"
+        f"PWD={DB_PASSWORD};"
         "TrustServerCertificate=yes;"
     )
 

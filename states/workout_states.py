@@ -15,5 +15,4 @@ class WorkoutStates(StatesGroup):
 
     choosing_category = State()   # Выбор категории упражнения
     choosing_exercise = State()   # Выбор конкретного упражнения
-    entering_weight = State()     # Ввод веса подхода
-    entering_reps = State()       # Ввод количества повторений
+    entering_set = State()        # Ввод подхода в формате вес/повторения
