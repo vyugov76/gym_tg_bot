@@ -3,6 +3,7 @@
 import os
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -27,18 +28,24 @@ from database.connection import close_db, init_db
 from handlers.start import router as start_router
 from handlers.workout import router as workout_router
 
-LOG_FILE = Path(__file__).parent / "bot_log.log"
+PROJECT_ROOT = Path(__file__).resolve().parent
+LOGS_DIR = PROJECT_ROOT / "logs"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 
 def setup_logging() -> logging.Logger:
-    """Настраивает логирование в файл (UTF-8) и в консоль."""
+    """Настраивает логирование в уникальный файл logs/ и в консоль."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = LOGS_DIR / f"bot_{timestamp}.log"
+
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
     formatter = logging.Formatter(LOG_FORMAT)
 
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
@@ -50,7 +57,9 @@ def setup_logging() -> logging.Logger:
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
-    return logging.getLogger(__name__)
+    app_logger = logging.getLogger(__name__)
+    app_logger.info("Логирование в файл: %s", log_file)
+    return app_logger
 
 
 logger = setup_logging()

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import os  # <-- ОБЯЗАТЕЛЬНО ДОБАВЛЯЕМ ЭТОТ ИМПОРТ
+import logging
+import os
+
 import aioodbc
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Находим путь к текущему файлу (connection.py)
 current_path = os.path.abspath(__file__)
@@ -45,12 +49,34 @@ def build_dsn() -> str:
 async def init_db() -> None:
     """Создаёт пул соединений с базой данных."""
     global _pool
-    _pool = await aioodbc.create_pool(
-        dsn=build_dsn(),
-        minsize=1,
-        maxsize=10,
-        autocommit=True,
-    )
+    pool_minsize = 1
+    pool_maxsize = 10
+
+    try:
+        _pool = await aioodbc.create_pool(
+            dsn=build_dsn(),
+            minsize=pool_minsize,
+            maxsize=pool_maxsize,
+            autocommit=True,
+        )
+        logger.info(
+            "Пул БД создан: driver=%s server=%s database=%s user=%s "
+            "minsize=%s maxsize=%s autocommit=True",
+            DB_DRIVER,
+            DB_SERVER,
+            DB_DATABASE,
+            DB_USER,
+            pool_minsize,
+            pool_maxsize,
+        )
+    except Exception:
+        logger.exception(
+            "Не удалось создать пул соединений: server=%s database=%s user=%s",
+            DB_SERVER,
+            DB_DATABASE,
+            DB_USER,
+        )
+        raise
 
 
 async def close_db() -> None:
@@ -60,6 +86,7 @@ async def close_db() -> None:
         _pool.close()
         await _pool.wait_closed()
         _pool = None
+        logger.info("Пул соединений с БД закрыт")
 
 
 def get_pool() -> aioodbc.Pool:

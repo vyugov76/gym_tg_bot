@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 
 from database.connection import get_pool
+
+logger = logging.getLogger(__name__)
 
 
 async def _fetch_one_dict(cur) -> dict[str, Any] | None:
@@ -42,19 +45,34 @@ async def get_user_by_telegram_id(telegram_id: int) -> dict[str, Any] | None:
 
 async def add_user(telegram_id: int, height: float, weight: float) -> int:
     """Регистрирует нового пользователя. Возвращает id записи."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO GTB_users (telegram_id, height, weight)
-                OUTPUT INSERTED.id_user
-                VALUES (?, ?, ?)
-                """,
-                (telegram_id, height, weight),
-            )
-            row = await cur.fetchone()
-            return int(row[0])
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO GTB_users (telegram_id, height, weight)
+                    OUTPUT INSERTED.id_user
+                    VALUES (?, ?, ?)
+                    """,
+                    (telegram_id, height, weight),
+                )
+                row = await cur.fetchone()
+                user_id = int(row[0])
+        logger.info(
+            "Пользователь добавлен: telegram_id=%s user_id=%s height=%s weight=%s",
+            telegram_id,
+            user_id,
+            height,
+            weight,
+        )
+        return user_id
+    except Exception:
+        logger.exception(
+            "Ошибка при добавлении пользователя: telegram_id=%s",
+            telegram_id,
+        )
+        raise
 
 
 async def create_workout(user_id: int) -> int:
@@ -93,19 +111,37 @@ async def add_workout_exercise(workout_id: int, category: str, exercise_name: st
 
 async def add_set(workout_exercise_id: int, set_number: int, weight: float, reps: int) -> int:
     """Записывает подход. Возвращает id записи."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO GTB_sets (workout_exercise_id, set_number, weight, reps)
-                OUTPUT INSERTED.id_set
-                VALUES (?, ?, ?, ?)
-                """,
-                (workout_exercise_id, set_number, weight, reps),
-            )
-            row = await cur.fetchone()
-            return int(row[0])
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO GTB_sets (workout_exercise_id, set_number, weight, reps)
+                    OUTPUT INSERTED.id_set
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (workout_exercise_id, set_number, weight, reps),
+                )
+                row = await cur.fetchone()
+                set_id = int(row[0])
+        logger.info(
+            "Подход сохранён: set_id=%s workout_exercise_id=%s "
+            "set_number=%s weight=%s reps=%s",
+            set_id,
+            workout_exercise_id,
+            set_number,
+            weight,
+            reps,
+        )
+        return set_id
+    except Exception:
+        logger.exception(
+            "Ошибка при сохранении подхода: workout_exercise_id=%s set_number=%s",
+            workout_exercise_id,
+            set_number,
+        )
+        raise
 
 
 async def calculate_workout_tonnage(workout_id: int) -> float:

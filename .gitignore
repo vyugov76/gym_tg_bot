@@ -148,7 +148,7 @@ activemq-data/
 *.sage.py
 
 # Bot logs
-bot_log.log
+logs/
 
 # Environments
 .env
