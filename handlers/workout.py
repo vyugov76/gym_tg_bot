@@ -1,4 +1,4 @@
-"""Логика записи тренировки: упражнения, подходы, расчёт тоннажа."""
+"""Логика записи тренировки: выбор упражнений, подходы, расчёт тоннажа."""
 
 import logging
 import re
@@ -9,27 +9,30 @@ from aiogram.types import CallbackQuery, Message
 
 import database.requests as db
 from keyboards.menu import (
-    EXERCISE_CATEGORIES,
     after_set_keyboard,
-    category_keyboard,
-    exercises_keyboard,
+    exercise_type_keyboard,
     main_menu_keyboard,
+    workout_exercises_keyboard,
 )
-from states.workout_states import WorkoutStates
+from states.workout_states import ExerciseStates, WorkoutStates
 
 router = Router(name="workout")
 logger = logging.getLogger(__name__)
 
 SET_INPUT_PATTERN = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+)\s*$")
+REPS_ONLY_PATTERN = re.compile(r"^\s*(\d+)\s*$")
 
-INVALID_FORMAT_MSG = (
+INVALID_WEIGHTED_MSG = (
     "Некорректный формат. Пожалуйста, введите данные в формате "
     "ВЕС/ПОВТОРЕНИЯ (например, 80/10):"
+)
+INVALID_REPS_MSG = (
+    "Некорректный формат. Введите целое число повторений от 1 до 100 "
+    "(например, 12):"
 )
 
 
 def _log_callback(callback: CallbackQuery) -> None:
-    """Логирует нажатие inline-кнопки."""
     logger.info(
         "Inline-кнопка: user_id=%s callback_data=%s",
         callback.from_user.id,
@@ -37,12 +40,7 @@ def _log_callback(callback: CallbackQuery) -> None:
     )
 
 
-async def _transition_state(
-    state: FSMContext,
-    user_id: int,
-    new_state,
-) -> None:
-    """Переводит FSM в новое состояние и логирует переход."""
+async def _transition_state(state: FSMContext, user_id: int, new_state) -> None:
     previous = await state.get_state()
     await state.set_state(new_state)
     logger.info(
@@ -53,8 +51,7 @@ async def _transition_state(
     )
 
 
-def _set_prompt(exercise_name: str, set_number: int) -> str:
-    """Текст запроса подхода в едином формате вес/повторения."""
+def _weighted_prompt(exercise_name: str, set_number: int) -> str:
     return (
         f"Упражнение: <b>{exercise_name}</b>\n"
         f"Подход {set_number} — введите <b>вес/повторения</b> "
@@ -62,26 +59,69 @@ def _set_prompt(exercise_name: str, set_number: int) -> str:
     )
 
 
-def parse_set_input(text: str | None) -> tuple[float, int] | None:
-    """Парсит строку «вес/повторения». Возвращает None при некорректном вводе."""
+def _bodyweight_prompt(exercise_name: str, set_number: int) -> str:
+    return (
+        f"Упражнение: <b>{exercise_name}</b> (собственный вес)\n"
+        f"Подход {set_number} — введите <b>количество повторений</b> "
+        f"(например, 12):"
+    )
+
+
+def _set_prompt(exercise_name: str, set_number: int, is_bodyweight: bool) -> str:
+    if is_bodyweight:
+        return _bodyweight_prompt(exercise_name, set_number)
+    return _weighted_prompt(exercise_name, set_number)
+
+
+def parse_weighted_set(text: str | None) -> tuple[float, int] | None:
     if not text:
         return None
-
     match = SET_INPUT_PATTERN.match(text)
     if not match:
         return None
-
     weight = float(match.group(1).replace(",", "."))
     reps = int(match.group(2))
-
     if weight < 0 or weight > 500 or reps <= 0 or reps > 100:
         return None
-
     return weight, reps
 
 
+def parse_bodyweight_reps(text: str | None) -> int | None:
+    if not text:
+        return None
+    match = REPS_ONLY_PATTERN.match(text)
+    if not match:
+        return None
+    reps = int(match.group(1))
+    if reps <= 0 or reps > 100:
+        return None
+    return reps
+
+
+def _merge_exercise_catalog(
+    db_exercises: list[dict],
+    session_exercises: list[dict],
+) -> list[dict]:
+    """Объединяет упражнения из БД и созданные в текущей сессии."""
+    seen: set[tuple[str, bool]] = set()
+    catalog: list[dict] = []
+
+    for ex in db_exercises:
+        key = (ex["name"], ex["is_bodyweight"])
+        if key not in seen:
+            seen.add(key)
+            catalog.append({"name": ex["name"], "is_bodyweight": ex["is_bodyweight"]})
+
+    for ex in session_exercises:
+        key = (ex["name"], ex["is_bodyweight"])
+        if key not in seen:
+            seen.add(key)
+            catalog.append({"name": ex["name"], "is_bodyweight": ex["is_bodyweight"]})
+
+    return catalog
+
+
 async def _require_user(message: Message) -> dict | None:
-    """Проверяет, что пользователь зарегистрирован."""
     user = await db.get_user_by_telegram_id(message.from_user.id)
     if not user:
         logger.warning(
@@ -92,9 +132,42 @@ async def _require_user(message: Message) -> dict | None:
     return user
 
 
+async def _show_workout_exercises(
+    target: Message | CallbackQuery,
+    state: FSMContext,
+    db_user_id: int,
+    telegram_id: int,
+    *,
+    edit: bool = False,
+    header: str | None = None,
+) -> None:
+    data = await state.get_data()
+    db_exercises = await db.get_exercises_by_user_id(db_user_id)
+    session_exercises = data.get("session_exercises", [])
+    catalog = _merge_exercise_catalog(db_exercises, session_exercises)
+    await state.update_data(exercise_catalog=catalog)
+
+    logger.info(
+        f"Пользователь {telegram_id} запросил список упражнений. Найдено: {len(catalog)}"
+    )
+
+    text = header or "🏋️ Выберите упражнение для тренировки:"
+    keyboard = workout_exercises_keyboard(catalog)
+
+    if isinstance(target, CallbackQuery):
+        if edit:
+            await target.message.edit_text(text, reply_markup=keyboard)
+        else:
+            await target.message.answer(text, reply_markup=keyboard)
+    else:
+        await target.answer(text, reply_markup=keyboard)
+
+    await _transition_state(state, telegram_id, WorkoutStates.choosing_exercise)
+
+
 @router.message(F.text == "Начать тренировку")
 async def start_workout(message: Message, state: FSMContext) -> None:
-    """Создаёт запись тренировки и предлагает выбрать упражнение."""
+    """Создаёт тренировку и показывает список упражнений пользователя."""
     user_id = message.from_user.id
     logger.info("Команда меню: user_id=%s text=%r", user_id, message.text)
 
@@ -113,164 +186,235 @@ async def start_workout(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось начать тренировку. Попробуйте позже.")
         return
 
-    await _transition_state(state, user_id, WorkoutStates.choosing_category)
     await state.update_data(
         workout_id=workout_id,
         set_number=1,
         workout_exercise_id=None,
+        exercise_name=None,
+        is_bodyweight=False,
+        db_user_id=user["id"],
+        session_exercises=[],
+        exercise_catalog=[],
     )
     logger.info("Тренировка начата: user_id=%s workout_id=%s", user_id, workout_id)
 
     await message.answer(
-        "🏋️ Тренировка начата!\nВыберите категорию упражнения:",
+        "🏋️ Тренировка начата!",
         reply_markup=main_menu_keyboard(),
     )
-    await message.answer(
-        "Категории:",
-        reply_markup=category_keyboard(),
-    )
+    await _show_workout_exercises(message, state, user["id"], user_id)
 
 
-@router.callback_query(WorkoutStates.choosing_category, F.data.startswith("cat:"))
-async def choose_category(callback: CallbackQuery, state: FSMContext) -> None:
-    """Обработка выбора категории упражнений."""
+@router.callback_query(WorkoutStates.choosing_exercise, F.data == "ex:create")
+async def create_exercise_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начало создания нового упражнения во время тренировки."""
     _log_callback(callback)
     user_id = callback.from_user.id
-    cat_id = callback.data.split(":", 1)[1]
-
-    if cat_id == "back":
-        await _transition_state(state, user_id, WorkoutStates.choosing_category)
-        await callback.message.edit_text(
-            "Выберите категорию упражнения:",
-            reply_markup=category_keyboard(),
-        )
-        await callback.answer()
-        return
-
-    if cat_id not in EXERCISE_CATEGORIES:
-        logger.warning(
-            "Неизвестная категория: user_id=%s cat_id=%s",
-            user_id,
-            cat_id,
-        )
-        await callback.answer("Неизвестная категория", show_alert=True)
-        return
-
-    await state.update_data(category_id=cat_id)
-    await _transition_state(state, user_id, WorkoutStates.choosing_exercise)
-
-    category_name = EXERCISE_CATEGORIES[cat_id]["name"]
-    logger.info(
-        "Выбрана категория: user_id=%s category=%s",
-        user_id,
-        category_name,
-    )
+    await _transition_state(state, user_id, ExerciseStates.waiting_for_name)
     await callback.message.edit_text(
-        f"Категория: <b>{category_name}</b>\nВыберите упражнение:",
-        reply_markup=exercises_keyboard(cat_id),
+        "Введите <b>название</b> нового упражнения (например, Жим штанги лёжа):"
     )
     await callback.answer()
 
 
-@router.callback_query(WorkoutStates.choosing_exercise, F.data.startswith("ex:"))
-async def choose_exercise(callback: CallbackQuery, state: FSMContext) -> None:
-    """Выбор упражнения — создаёт запись в workout_exercises."""
+@router.message(ExerciseStates.waiting_for_name)
+async def process_exercise_name(message: Message, state: FSMContext) -> None:
+    """Принимает название нового упражнения."""
+    user_id = message.from_user.id
+    name = (message.text or "").strip()
+
+    if not name or len(name) > 100:
+        logger.warning(
+            "Некорректное название упражнения: user_id=%s text=%r",
+            user_id,
+            message.text,
+        )
+        await message.answer("Введите название от 1 до 100 символов:")
+        return
+
+    logger.info(f"Пользователь {user_id} ввел название нового упражнения: '{name}'")
+    await state.update_data(pending_exercise_name=name)
+    await _transition_state(state, user_id, ExerciseStates.waiting_for_type)
+    await message.answer(
+        f"Упражнение: <b>{name}</b>\nВыберите тип:",
+        reply_markup=exercise_type_keyboard(),
+    )
+
+
+@router.callback_query(ExerciseStates.waiting_for_type, F.data.startswith("ex:type:"))
+async def process_exercise_type(callback: CallbackQuery, state: FSMContext) -> None:
+    """Сохраняет тип упражнения и возвращает к выбору для тренировки."""
     _log_callback(callback)
     user_id = callback.from_user.id
-    _, cat_id, idx_str = callback.data.split(":", 2)
-    idx = int(idx_str)
-
-    exercise_name = EXERCISE_CATEGORIES[cat_id]["exercises"][idx]
+    is_bodyweight = callback.data.split(":")[-1] == "1"
     data = await state.get_data()
+    name = data.get("pending_exercise_name")
+    db_user_id = data.get("db_user_id")
+
+    if not name or not db_user_id:
+        await callback.answer("Данные упражнения потеряны. Начните заново.", show_alert=True)
+        return
+
+    logger.info(
+        f"Пользователь {user_id} установил тип упражнения '{name}': "
+        f"is_bodyweight={int(is_bodyweight)}"
+    )
+
+    session_exercises = data.get("session_exercises", [])
+    session_exercises.append({"name": name, "is_bodyweight": is_bodyweight})
+    await state.update_data(
+        pending_exercise_name=None,
+        session_exercises=session_exercises,
+    )
+
+    db_exercises = await db.get_exercises_by_user_id(db_user_id)
+    catalog = _merge_exercise_catalog(db_exercises, session_exercises)
+    await state.update_data(exercise_catalog=catalog)
+    logger.info(
+        f"Пользователь {user_id} запросил список упражнений. Найдено: {len(catalog)}"
+    )
+
+    await callback.message.edit_text(
+        f"✅ Упражнение <b>{name}</b> создано!\n\n"
+        f"🏋️ Выберите упражнение для тренировки:",
+        reply_markup=workout_exercises_keyboard(catalog),
+    )
+    await _transition_state(state, user_id, WorkoutStates.choosing_exercise)
+    await callback.answer()
+
+
+@router.callback_query(WorkoutStates.choosing_exercise, F.data.startswith("ex:select:"))
+async def select_exercise(callback: CallbackQuery, state: FSMContext) -> None:
+    """Выбор упражнения для записи подходов."""
+    _log_callback(callback)
+    user_id = callback.from_user.id
+    idx = int(callback.data.split(":")[-1])
+    data = await state.get_data()
+    catalog = data.get("exercise_catalog", [])
+    db_user_id = data.get("db_user_id")
+
+    if idx < 0 or idx >= len(catalog):
+        await callback.answer("Упражнение не найдено", show_alert=True)
+        return
+
+    exercise = catalog[idx]
+    exercise_name = exercise["name"]
+    is_bodyweight = exercise["is_bodyweight"]
 
     try:
         workout_exercise_id = await db.add_workout_exercise(
             workout_id=data["workout_id"],
-            category=EXERCISE_CATEGORIES[cat_id]["name"],
+            user_id=db_user_id,
             exercise_name=exercise_name,
+            is_bodyweight=is_bodyweight,
         )
     except Exception:
         logger.exception(
-            "Не удалось добавить упражнение: user_id=%s workout_id=%s exercise=%s",
+            "Не удалось выбрать упражнение: user_id=%s exercise_name=%s",
             user_id,
-            data.get("workout_id"),
             exercise_name,
         )
-        await callback.answer("Ошибка сохранения упражнения", show_alert=True)
+        await callback.answer("Ошибка выбора упражнения", show_alert=True)
         return
 
     await state.update_data(
         workout_exercise_id=workout_exercise_id,
         exercise_name=exercise_name,
+        is_bodyweight=is_bodyweight,
         set_number=1,
     )
     await _transition_state(state, user_id, WorkoutStates.entering_set)
 
     logger.info(
-        "Выбрано упражнение: user_id=%s exercise=%s workout_exercise_id=%s",
+        "Выбрано упражнение: user_id=%s workout_exercise_id=%s name=%s is_bodyweight=%s",
         user_id,
-        exercise_name,
         workout_exercise_id,
+        exercise_name,
+        is_bodyweight,
     )
-    await callback.message.edit_text(_set_prompt(exercise_name, 1))
+    await callback.message.edit_text(
+        _set_prompt(exercise_name, 1, is_bodyweight)
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data == "set:next_ex")
 async def next_exercise(callback: CallbackQuery, state: FSMContext) -> None:
-    """Переход к выбору следующего упражнения."""
+    """Возврат к выбору упражнения."""
     _log_callback(callback)
-    await _transition_state(
-        state,
-        callback.from_user.id,
-        WorkoutStates.choosing_category,
-    )
-    await callback.message.edit_text(
-        "Выберите категорию упражнения:",
-        reply_markup=category_keyboard(),
-    )
+    data = await state.get_data()
+    db_user_id = data.get("db_user_id")
+
+    if not db_user_id:
+        user = await db.get_user_by_telegram_id(callback.from_user.id)
+        if not user:
+            await callback.answer("Сначала нажмите /start", show_alert=True)
+            return
+        db_user_id = user["id"]
+        await state.update_data(db_user_id=db_user_id)
+
+    await callback.message.edit_text("Выберите упражнение:")
+    await _show_workout_exercises(callback, state, db_user_id, callback.from_user.id, edit=True)
     await callback.answer()
 
 
 @router.callback_query(F.data == "set:more")
 async def add_more_set(callback: CallbackQuery, state: FSMContext) -> None:
-    """Запрос следующего подхода того же упражнения."""
+    """Запрос следующего подхода."""
     _log_callback(callback)
     data = await state.get_data()
     set_number = data.get("set_number", 1)
+    is_bodyweight = data.get("is_bodyweight", False)
 
     await _transition_state(
         state,
         callback.from_user.id,
         WorkoutStates.entering_set,
     )
-    await callback.message.answer(_set_prompt(data["exercise_name"], set_number))
+    await callback.message.answer(
+        _set_prompt(data["exercise_name"], set_number, is_bodyweight)
+    )
     await callback.answer()
 
 
 @router.message(WorkoutStates.entering_set)
 async def process_set(message: Message, state: FSMContext) -> None:
-    """Принимает подход в формате вес/повторения и сохраняет его в БД."""
+    """Принимает подход и сохраняет его в БД."""
     user_id = message.from_user.id
+    data = await state.get_data()
+    workout_exercise_id = data.get("workout_exercise_id")
+    is_bodyweight = data.get("is_bodyweight", False)
+    set_number = data["set_number"]
+
     logger.info(
-        "Пользователь %s ввел данные тренировки: %s",
-        user_id,
-        message.text,
+        f"Пользователь {user_id} записал подход для упражнения {workout_exercise_id} "
+        f"(со своим весом={int(is_bodyweight)}): {message.text}"
     )
 
-    parsed = parse_set_input(message.text)
-    if parsed is None:
-        logger.warning(
-            "Некорректный формат подхода: user_id=%s text=%r",
-            user_id,
-            message.text,
-        )
-        await message.answer(INVALID_FORMAT_MSG)
-        return
+    weight: float | None = None
+    reps: int | None = None
 
-    weight, reps = parsed
-    data = await state.get_data()
-    set_number = data["set_number"]
+    if is_bodyweight:
+        reps = parse_bodyweight_reps(message.text)
+        if reps is None:
+            logger.warning(
+                "Некорректный ввод повторений: user_id=%s text=%r",
+                user_id,
+                message.text,
+            )
+            await message.answer(INVALID_REPS_MSG)
+            return
+    else:
+        parsed = parse_weighted_set(message.text)
+        if parsed is None:
+            logger.warning(
+                "Некорректный формат подхода: user_id=%s text=%r",
+                user_id,
+                message.text,
+            )
+            await message.answer(INVALID_WEIGHTED_MSG)
+            return
+        weight, reps = parsed
 
     try:
         await db.add_set(
@@ -289,21 +433,27 @@ async def process_set(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось сохранить подход. Попробуйте ещё раз.")
         return
 
-    tonnage = weight * reps
     await state.update_data(set_number=set_number + 1)
 
+    if is_bodyweight:
+        result_text = f"✅ Подход {set_number} записан: {reps} повторений (собственный вес)"
+    else:
+        tonnage = weight * reps
+        result_text = (
+            f"✅ Подход {set_number} записан: "
+            f"{weight} кг × {reps} = {tonnage:.0f} кг"
+        )
+
     logger.info(
-        "Подход записан: user_id=%s set_number=%s weight=%s reps=%s tonnage=%s",
+        "Подход сохранён: user_id=%s workout_exercise_id=%s set_number=%s weight=%s reps=%s",
         user_id,
+        workout_exercise_id,
         set_number,
         weight,
         reps,
-        tonnage,
     )
     await message.answer(
-        f"✅ Подход {set_number} записан: "
-        f"{weight} кг × {reps} = {tonnage:.0f} кг\n\n"
-        f"Что дальше?",
+        f"{result_text}\n\nЧто дальше?",
         reply_markup=after_set_keyboard(),
     )
 
