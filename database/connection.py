@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -47,36 +48,45 @@ def build_dsn() -> str:
 
 
 async def init_db() -> None:
-    """Создаёт пул соединений с базой данных."""
+    """Создаёт пул соединений с базой данных (с повторными попытками)."""
     global _pool
     pool_minsize = 1
     pool_maxsize = 10
+    retries = 5
+    last_error: Exception | None = None
 
-    try:
-        _pool = await aioodbc.create_pool(
-            dsn=build_dsn(),
-            minsize=pool_minsize,
-            maxsize=pool_maxsize,
-            autocommit=True,
-        )
-        logger.info(
-            "Пул БД создан: driver=%s server=%s database=%s user=%s "
-            "minsize=%s maxsize=%s autocommit=True",
-            DB_DRIVER,
-            DB_SERVER,
-            DB_DATABASE,
-            DB_USER,
-            pool_minsize,
-            pool_maxsize,
-        )
-    except Exception:
-        logger.exception(
-            "Не удалось создать пул соединений: server=%s database=%s user=%s",
-            DB_SERVER,
-            DB_DATABASE,
-            DB_USER,
-        )
-        raise
+    for attempt in range(1, retries + 1):
+        logger.info(f"Попытка подключения к БД {attempt}/{retries}...")
+        try:
+            _pool = await aioodbc.create_pool(
+                dsn=build_dsn(),
+                minsize=pool_minsize,
+                maxsize=pool_maxsize,
+                autocommit=True,
+            )
+            logger.info("Пул соединений с БД успешно создан!")
+            logger.info(
+                "Параметры пула: driver=%s server=%s database=%s user=%s "
+                "minsize=%s maxsize=%s autocommit=True",
+                DB_DRIVER,
+                DB_SERVER,
+                DB_DATABASE,
+                DB_USER,
+                pool_minsize,
+                pool_maxsize,
+            )
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"Попытка {attempt} завершилась тайм-аутом сети. "
+                f"Повторный запрос через 3 сек..."
+            )
+            if attempt < retries:
+                await asyncio.sleep(3)
+
+    logger.critical("Все попытки подключения к базе данных исчерпаны.")
+    raise last_error
 
 
 async def close_db() -> None:

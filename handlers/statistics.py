@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -13,90 +13,12 @@ from aiogram_calendar.schemas import SimpleCalAct
 
 import database.requests as db
 from keyboards.workout_calendar import WorkoutCalendar
+from utils.workout_display import format_calendar_workout, format_duration, to_local_datetime
 
 router = Router(name="statistics")
 logger = logging.getLogger(__name__)
 
 CALENDAR_LOCALE = "ru_RU"
-
-
-def _approaches_label(count: int) -> str:
-    """Склонение слова «подход»."""
-    if count % 10 == 1 and count % 100 != 11:
-        suffix = "подход"
-    elif 2 <= count % 10 <= 4 and not (12 <= count % 100 <= 14):
-        suffix = "подхода"
-    else:
-        suffix = "подходов"
-    return f"{count} {suffix}"
-
-
-def _format_weight(value: float | None) -> str:
-    if value is None:
-        return ""
-    if float(value).is_integer():
-        return str(int(value))
-    return str(value).rstrip("0").rstrip(".")
-
-
-def _format_duration(started_at: datetime, finished_at: datetime | None) -> str:
-    if not finished_at:
-        return "—"
-    minutes = int((finished_at - started_at).total_seconds() // 60)
-    if minutes >= 60:
-        hours = minutes // 60
-        mins = minutes % 60
-        if mins:
-            return f"{hours} ч. {mins} мин."
-        return f"{hours} ч."
-    return f"{minutes} минут"
-
-
-def _format_workout_detail(rows: list[dict], selected_date: date) -> str:
-    """Форматирует одну тренировку по заданному шаблону."""
-    first = rows[0]
-    started_at: datetime = first["started_at"]
-    finished_at: datetime | None = first.get("finished_at")
-    total_tonnage = float(first["total_tonnage"])
-
-    lines = [
-        f"📅 Тренировка на {selected_date.strftime('%d.%m.%Y')}",
-        f"Начало тренировки: {started_at.strftime('%H:%M')}",
-        f"Продолжительность: {_format_duration(started_at, finished_at)}",
-        f"Общий тоннаж: {total_tonnage:.0f} кг",
-        "",
-    ]
-
-    exercises: dict[int, dict] = {}
-    for row in rows:
-        if row.get("set_number") is None:
-            continue
-        we_id = row["id_workout_exercise"]
-        if we_id not in exercises:
-            exercises[we_id] = {
-                "name": row["exercise_name"],
-                "is_bodyweight": row["is_bodyweight"],
-                "sets": [],
-            }
-        exercises[we_id]["sets"].append(row)
-
-    for ex_data in exercises.values():
-        sets = sorted(ex_data["sets"], key=lambda s: s["set_number"])
-        exercise_name = ex_data["name"]
-        is_bodyweight = ex_data["is_bodyweight"]
-        lines.append(f"· {exercise_name} — {_approaches_label(len(sets))}")
-
-        if is_bodyweight:
-            parts = [f"{s['reps']} повт." for s in sets]
-        else:
-            parts = [
-                f"{_format_weight(s['weight'])}/{s['reps']}"
-                for s in sets
-            ]
-        lines.append(" ".join(parts))
-        lines.append("")
-
-    return "\n".join(lines).rstrip()
 
 
 def _calendar_open_keyboard() -> InlineKeyboardMarkup:
@@ -238,9 +160,22 @@ async def process_calendar_selection(
     for row in rows:
         workouts_data[row["id_workout"]].append(row)
 
-    messages = [
-        _format_workout_detail(w_rows, selected_day)
-        for w_rows in workouts_data.values()
-    ]
+    messages = []
+    for w_rows in workouts_data.values():
+        first = w_rows[0]
+        start_local = to_local_datetime(first["started_at"])
+        finish_local = to_local_datetime(first.get("finished_at"))
+        duration_min = round(
+            (finish_local - start_local).total_seconds() / 60
+        ) if finish_local and start_local else 0
+        logger.info(
+            "Детали тренировки: workout_id=%s started=%s finished=%s duration_min=%s",
+            first["id_workout"],
+            start_local,
+            finish_local,
+            duration_min,
+        )
+        messages.append(format_calendar_workout(w_rows, selected_day))
+
     await callback.message.answer("\n\n".join(messages))
     await callback.answer()

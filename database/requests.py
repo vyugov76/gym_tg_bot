@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date
 from typing import Any, Literal
 
 from database.connection import get_pool
@@ -210,54 +210,35 @@ async def add_set(
     return int(set_id)
 
 
-async def calculate_workout_tonnage(workout_id: int) -> float:
-    total = await _run_query(
-        """
-        SELECT COALESCE(SUM(COALESCE(s.weight, 0) * s.reps), 0)
-        FROM GTB_sets s
-        INNER JOIN GTB_workout_exercises we
-            ON we.id_workout_exercise = s.workout_exercise_id
-        WHERE we.workout_id = ?
-        """,
-        (workout_id,),
-        fetch="scalar",
-    )
-    return float(total)
-
-
-async def finish_workout(workout_id: int, total_tonnage: float) -> None:
+async def finish_workout(workout_id: int) -> None:
+    """Завершает тренировку. finished_at ставится на стороне SQL Server (SYSDATETIME)."""
     await _run_query(
         """
         UPDATE GTB_workouts
-        SET finished_at = ?, total_tonnage = ?
+        SET finished_at = SYSDATETIME()
         WHERE id_workout = ?
         """,
-        (datetime.now(), total_tonnage, workout_id),
+        (workout_id,),
     )
 
 
 async def get_user_workout_stats(user_id: int) -> dict[str, Any]:
     row = await _run_query(
         """
-        SELECT
-            COUNT(*) AS workout_count,
-            COALESCE(SUM(total_tonnage), 0) AS total_tonnage
+        SELECT COUNT(*) AS workout_count
         FROM GTB_workouts
         WHERE user_id = ? AND finished_at IS NOT NULL
         """,
         (user_id,),
         fetch="one",
     )
-    return {
-        "workout_count": int(row["workout_count"]),
-        "total_tonnage": float(row["total_tonnage"]),
-    }
+    return {"workout_count": int(row["workout_count"])}
 
 
 async def get_last_workouts(user_id: int, limit: int = 5) -> list[dict[str, Any]]:
     return await _run_query(
         """
-        SELECT TOP (?) id_workout AS id, started_at, finished_at, total_tonnage
+        SELECT TOP (?) id_workout AS id, started_at, finished_at
         FROM GTB_workouts
         WHERE user_id = ? AND finished_at IS NOT NULL
         ORDER BY finished_at DESC
@@ -318,7 +299,6 @@ async def get_detailed_workouts_by_date(
             w.id_workout,
             w.started_at,
             w.finished_at,
-            w.total_tonnage,
             we.id_workout_exercise,
             we.exercise_name,
             we.is_bodyweight,
@@ -338,6 +318,39 @@ async def get_detailed_workouts_by_date(
         (user_id, selected_date),
         fetch="all",
     )
+    return _normalize_workout_detail_rows(rows)
+
+
+async def get_workout_detail_by_id(workout_id: int) -> list[dict[str, Any]]:
+    """Детальная информация о конкретной завершённой тренировке."""
+    rows = await _run_query(
+        """
+        SELECT
+            w.id_workout,
+            w.started_at,
+            w.finished_at,
+            we.id_workout_exercise,
+            we.exercise_name,
+            we.is_bodyweight,
+            s.set_number,
+            s.weight,
+            s.reps
+        FROM GTB_workouts w
+        INNER JOIN GTB_workout_exercises we
+            ON we.workout_id = w.id_workout
+        LEFT JOIN GTB_sets s
+            ON s.workout_exercise_id = we.id_workout_exercise
+        WHERE w.id_workout = ?
+          AND w.finished_at IS NOT NULL
+        ORDER BY we.id_workout_exercise, s.set_number
+        """,
+        (workout_id,),
+        fetch="all",
+    )
+    return _normalize_workout_detail_rows(rows)
+
+
+def _normalize_workout_detail_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         row["is_bodyweight"] = _as_bool(row["is_bodyweight"])
     return rows

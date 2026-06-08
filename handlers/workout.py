@@ -1,4 +1,4 @@
-"""Логика записи тренировки: выбор упражнений, подходы, расчёт тоннажа."""
+"""Логика записи тренировки: выбор упражнений и запись подходов."""
 
 import logging
 import re
@@ -15,6 +15,7 @@ from keyboards.menu import (
     workout_exercises_keyboard,
 )
 from states.workout_states import ExerciseStates, WorkoutStates
+from utils.workout_display import format_duration, format_finish_workout, to_local_datetime
 
 router = Router(name="workout")
 logger = logging.getLogger(__name__)
@@ -438,11 +439,7 @@ async def process_set(message: Message, state: FSMContext) -> None:
     if is_bodyweight:
         result_text = f"✅ Подход {set_number} записан: {reps} повторений (собственный вес)"
     else:
-        tonnage = weight * reps
-        result_text = (
-            f"✅ Подход {set_number} записан: "
-            f"{weight} кг × {reps} = {tonnage:.0f} кг"
-        )
+        result_text = f"✅ Подход {set_number} записан: {weight} кг × {reps}"
 
     logger.info(
         "Подход сохранён: user_id=%s workout_exercise_id=%s set_number=%s weight=%s reps=%s",
@@ -460,7 +457,7 @@ async def process_set(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "set:finish")
 async def finish_workout(callback: CallbackQuery, state: FSMContext) -> None:
-    """Завершает тренировку и показывает итоговый тоннаж."""
+    """Завершает тренировку и показывает детальный отчёт."""
     _log_callback(callback)
     user_id = callback.from_user.id
     data = await state.get_data()
@@ -475,8 +472,8 @@ async def finish_workout(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     try:
-        total_tonnage = await db.calculate_workout_tonnage(workout_id)
-        await db.finish_workout(workout_id, total_tonnage)
+        await db.finish_workout(workout_id)
+        rows = await db.get_workout_detail_by_id(workout_id)
     except Exception:
         logger.exception(
             "Не удалось завершить тренировку: user_id=%s workout_id=%s",
@@ -487,16 +484,33 @@ async def finish_workout(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.clear()
-    logger.info(
-        "Тренировка завершена: user_id=%s workout_id=%s total_tonnage=%s",
-        user_id,
-        workout_id,
-        total_tonnage,
-    )
 
-    await callback.message.edit_text(
-        f"🎉 Тренировка завершена!\n\n"
-        f"Суммарный тоннаж: <b>{total_tonnage:.0f} кг</b>\n"
-        f"Отличная работа!"
-    )
+    if rows:
+        first = rows[0]
+        start_local = to_local_datetime(first["started_at"])
+        finish_local = to_local_datetime(first.get("finished_at"))
+        duration_str = format_duration(first["started_at"], first.get("finished_at"))
+        duration_min = round(
+            (finish_local - start_local).total_seconds() / 60
+        ) if finish_local and start_local else 0
+        logger.info(
+            "Тренировка завершена: user_id=%s workout_id=%s "
+            "started=%s finished=%s duration_min=%s duration_str=%s",
+            user_id,
+            workout_id,
+            start_local,
+            finish_local,
+            duration_min,
+            duration_str,
+        )
+        report = format_finish_workout(rows)
+    else:
+        logger.info(
+            "Тренировка завершена без упражнений: user_id=%s workout_id=%s",
+            user_id,
+            workout_id,
+        )
+        report = "🎉 Тренировка завершена! Отличная работа!"
+
+    await callback.message.edit_text(report)
     await callback.answer("Тренировка сохранена!")
