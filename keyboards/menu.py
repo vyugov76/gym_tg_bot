@@ -16,7 +16,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Начать тренировку")],
             [
-                KeyboardButton(text="Моя статистика"),
+                KeyboardButton(text="Статистика"),
                 KeyboardButton(text="Мои упражнения"),
             ],
             [KeyboardButton(text="Профиль")],

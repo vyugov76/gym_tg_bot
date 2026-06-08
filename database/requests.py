@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from database.connection import get_pool
@@ -265,3 +265,79 @@ async def get_last_workouts(user_id: int, limit: int = 5) -> list[dict[str, Any]
         (limit, user_id),
         fetch="all",
     )
+
+
+# --- Статистика ---
+
+
+async def get_total_workouts_for_current_month(user_id: int) -> int:
+    """Количество завершённых тренировок за текущий календарный месяц."""
+    count = await _run_query(
+        """
+        SELECT COUNT(*) AS total
+        FROM GTB_workouts
+        WHERE user_id = ?
+          AND finished_at IS NOT NULL
+          AND YEAR(finished_at) = YEAR(GETDATE())
+          AND MONTH(finished_at) = MONTH(GETDATE())
+        """,
+        (user_id,),
+        fetch="scalar",
+    )
+    return int(count or 0)
+
+
+async def get_workout_days_for_month(user_id: int, year: int, month: int) -> set[int]:
+    """Множество номеров дней месяца, в которые были завершённые тренировки."""
+    rows = await _run_query(
+        """
+        SELECT DISTINCT DAY(started_at) AS workout_day
+        FROM GTB_workouts
+        WHERE user_id = ?
+          AND finished_at IS NOT NULL
+          AND YEAR(started_at) = ?
+          AND MONTH(started_at) = ?
+        """,
+        (user_id, year, month),
+        fetch="all",
+    )
+    return {int(row["workout_day"]) for row in rows}
+
+
+async def get_detailed_workouts_by_date(
+    user_id: int,
+    selected_date: date,
+) -> list[dict[str, Any]]:
+    """
+    JOIN GTB_workouts, GTB_workout_exercises и GTB_sets за выбранную дату.
+    Фильтр по CAST(w.started_at AS DATE). user_id — внутренний id_user.
+    """
+    rows = await _run_query(
+        """
+        SELECT
+            w.id_workout,
+            w.started_at,
+            w.finished_at,
+            w.total_tonnage,
+            we.id_workout_exercise,
+            we.exercise_name,
+            we.is_bodyweight,
+            s.set_number,
+            s.weight,
+            s.reps
+        FROM GTB_workouts w
+        INNER JOIN GTB_workout_exercises we
+            ON we.workout_id = w.id_workout
+        LEFT JOIN GTB_sets s
+            ON s.workout_exercise_id = we.id_workout_exercise
+        WHERE w.user_id = ?
+          AND w.finished_at IS NOT NULL
+          AND CAST(w.started_at AS DATE) = ?
+        ORDER BY w.started_at, we.id_workout_exercise, s.set_number
+        """,
+        (user_id, selected_date),
+        fetch="all",
+    )
+    for row in rows:
+        row["is_bodyweight"] = _as_bool(row["is_bodyweight"])
+    return rows

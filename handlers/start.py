@@ -93,28 +93,3 @@ async def show_profile(message: Message) -> None:
         f"Дата регистрации: {user['created_at'].strftime('%d.%m.%Y')}",
     )
 
-
-@router.message(F.text == "Моя статистика")
-async def show_stats(message: Message) -> None:
-    """Показывает сводную статистику тренировок."""
-    user = await db.get_user_by_telegram_id(message.from_user.id)
-    if not user:
-        await message.answer("Сначала нажмите /start для регистрации.")
-        return
-
-    stats = await db.get_user_workout_stats(user["id"])
-    workouts = await db.get_last_workouts(user["id"])
-
-    lines = [
-        "📊 <b>Моя статистика</b>\n",
-        f"Завершённых тренировок: {stats['workout_count']}",
-        f"Суммарный тоннаж: {stats['total_tonnage']:.0f} кг",
-    ]
-
-    if workouts:
-        lines.append("\n<b>Последние тренировки:</b>")
-        for w in workouts:
-            date = w["finished_at"].strftime("%d.%m.%Y")
-            lines.append(f"• {date} — {w['total_tonnage']:.0f} кг")
-
-    await message.answer("\n".join(lines))
