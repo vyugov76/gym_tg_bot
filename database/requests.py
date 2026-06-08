@@ -52,12 +52,14 @@ async def _run_query(
         raise
 
 
-def _as_bool(value: Any) -> bool:
-    return bool(value)
+def _as_exercise_type(value: Any) -> int:
+    """Тип упражнения: 0 — с весом, 1 — своий вес, 2 — на время."""
+    return int(value) if value is not None else 0
 
 
 def _normalize_exercise_row(row: dict[str, Any]) -> dict[str, Any]:
-    row["is_bodyweight"] = _as_bool(row["is_bodyweight"])
+    row["is_bodyweight"] = _as_exercise_type(row["is_bodyweight"])
+    row["exercise_type"] = row["is_bodyweight"]
     return row
 
 
@@ -73,6 +75,28 @@ async def get_user_by_telegram_id(telegram_id: int) -> dict[str, Any] | None:
         """,
         (telegram_id,),
         fetch="one",
+    )
+
+
+async def update_user_height(user_id: int, height: float) -> None:
+    await _run_query(
+        """
+        UPDATE GTB_users
+        SET height = ?
+        WHERE id_user = ?
+        """,
+        (height, user_id),
+    )
+
+
+async def update_user_weight(user_id: int, weight: float) -> None:
+    await _run_query(
+        """
+        UPDATE GTB_users
+        SET weight = ?
+        WHERE id_user = ?
+        """,
+        (weight, user_id),
     )
 
 
@@ -141,18 +165,20 @@ async def update_exercise_name(exercise_id: int, new_name: str) -> None:
     )
 
 
-async def toggle_exercise_bodyweight(exercise_id: int) -> bool:
+async def cycle_exercise_type(exercise_id: int) -> int:
+    """Переключает тип упражнения по циклу 0 → 1 → 2 → 0."""
     exercise = await get_exercise_by_id(exercise_id)
     if not exercise:
-        return False
-    new_value = not exercise["is_bodyweight"]
+        return 0
+    current = _as_exercise_type(exercise["is_bodyweight"])
+    new_value = (current + 1) % 3
     await _run_query(
         """
         UPDATE GTB_workout_exercises
         SET is_bodyweight = ?
         WHERE user_id = ? AND exercise_name = ? AND is_bodyweight = ?
         """,
-        (int(new_value), exercise["user_id"], exercise["name"], int(exercise["is_bodyweight"])),
+        (new_value, exercise["user_id"], exercise["name"], current),
     )
     return new_value
 
@@ -177,7 +203,7 @@ async def add_workout_exercise(
     workout_id: int,
     user_id: int,
     exercise_name: str,
-    is_bodyweight: bool,
+    exercise_type: int,
 ) -> int:
     workout_exercise_id = await _run_query(
         """
@@ -186,7 +212,7 @@ async def add_workout_exercise(
         OUTPUT INSERTED.id_workout_exercise
         VALUES (?, ?, ?, ?)
         """,
-        (workout_id, user_id, exercise_name, int(is_bodyweight)),
+        (workout_id, user_id, exercise_name, exercise_type),
         fetch="scalar",
     )
     return int(workout_exercise_id)
@@ -208,6 +234,31 @@ async def add_set(
         fetch="scalar",
     )
     return int(set_id)
+
+
+async def delete_last_set(workout_exercise_id: int) -> int | None:
+    """Удаляет последний подход упражнения. Возвращает номер удалённого подхода."""
+    set_number = await _run_query(
+        """
+        SELECT TOP 1 set_number
+        FROM GTB_sets
+        WHERE workout_exercise_id = ?
+        ORDER BY set_number DESC, id_set DESC
+        """,
+        (workout_exercise_id,),
+        fetch="scalar",
+    )
+    if set_number is None:
+        return None
+
+    await _run_query(
+        """
+        DELETE FROM GTB_sets
+        WHERE workout_exercise_id = ? AND set_number = ?
+        """,
+        (workout_exercise_id, int(set_number)),
+    )
+    return int(set_number)
 
 
 async def finish_workout(workout_id: int) -> None:
@@ -321,6 +372,80 @@ async def get_detailed_workouts_by_date(
     return _normalize_workout_detail_rows(rows)
 
 
+async def get_workout_user_id(workout_id: int) -> int | None:
+    """Возвращает id_user владельца тренировки или None."""
+    user_id = await _run_query(
+        """
+        SELECT user_id
+        FROM GTB_workouts
+        WHERE id_workout = ?
+        """,
+        (workout_id,),
+        fetch="scalar",
+    )
+    return int(user_id) if user_id is not None else None
+
+
+async def delete_workout(workout_id: int) -> None:
+    """Удаляет тренировку и все связанные подходы/упражнения."""
+    await _run_query(
+        """
+        DELETE s
+        FROM GTB_sets s
+        INNER JOIN GTB_workout_exercises we
+            ON we.id_workout_exercise = s.workout_exercise_id
+        WHERE we.workout_id = ?
+        """,
+        (workout_id,),
+    )
+    await _run_query(
+        """
+        DELETE FROM GTB_workout_exercises
+        WHERE workout_id = ?
+        """,
+        (workout_id,),
+    )
+    await _run_query(
+        """
+        DELETE FROM GTB_workouts
+        WHERE id_workout = ?
+        """,
+        (workout_id,),
+    )
+
+
+async def get_set_by_number(
+    workout_exercise_id: int,
+    set_number: int,
+) -> dict[str, Any] | None:
+    """Возвращает подход по номеру внутри упражнения."""
+    return await _run_query(
+        """
+        SELECT id_set AS id, set_number, weight, reps
+        FROM GTB_sets
+        WHERE workout_exercise_id = ? AND set_number = ?
+        """,
+        (workout_exercise_id, set_number),
+        fetch="one",
+    )
+
+
+async def update_set(
+    set_id: int,
+    reps: int,
+    weight: float | None = None,
+) -> None:
+    """Обновляет weight и reps подхода."""
+    await _run_query(
+        """
+        UPDATE GTB_sets
+        SET weight = ?, reps = ?
+        WHERE id_set = ?
+        """,
+        (weight, reps, set_id),
+    )
+
+
 async def get_workout_detail_by_id(workout_id: int) -> list[dict[str, Any]]:
     """Детальная информация о конкретной завершённой тренировке."""
     rows = await _run_query(
@@ -352,5 +477,6 @@ async def get_workout_detail_by_id(workout_id: int) -> list[dict[str, Any]]:
 
 def _normalize_workout_detail_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
-        row["is_bodyweight"] = _as_bool(row["is_bodyweight"])
+        row["is_bodyweight"] = _as_exercise_type(row["is_bodyweight"])
+        row["exercise_type"] = row["is_bodyweight"]
     return rows

@@ -9,6 +9,7 @@ from aiogram.types import CallbackQuery, Message
 import database.requests as db
 from keyboards.menu import exercise_manage_keyboard, my_exercises_keyboard
 from states.workout_states import EditExerciseStates
+from utils.exercise_types import EXERCISE_TYPE_LABELS, normalize_exercise_type
 
 router = Router(name="exercises")
 logger = logging.getLogger(__name__)
@@ -20,6 +21,13 @@ def _log_callback(callback: CallbackQuery) -> None:
         callback.from_user.id,
         callback.data,
     )
+
+
+def _type_label(exercise: dict) -> str:
+    exercise_type = normalize_exercise_type(
+        exercise.get("exercise_type", exercise.get("is_bodyweight"))
+    )
+    return EXERCISE_TYPE_LABELS.get(exercise_type, "неизвестно")
 
 
 async def _show_exercises_list(
@@ -49,7 +57,6 @@ async def _show_exercises_list(
 
 @router.message(F.text == "Мои упражнения")
 async def show_my_exercises(message: Message, state: FSMContext) -> None:
-    """Показывает список упражнений пользователя."""
     await state.clear()
     user_id = message.from_user.id
     user = await db.get_user_by_telegram_id(user_id)
@@ -83,7 +90,6 @@ async def noop_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "myex:back")
 async def back_to_exercises_list(callback: CallbackQuery, state: FSMContext) -> None:
-    """Возврат к списку упражнений."""
     _log_callback(callback)
     await state.clear()
     user = await db.get_user_by_telegram_id(callback.from_user.id)
@@ -96,7 +102,6 @@ async def back_to_exercises_list(callback: CallbackQuery, state: FSMContext) -> 
 
 @router.callback_query(F.data.startswith("myex:view:"))
 async def view_exercise(callback: CallbackQuery, state: FSMContext) -> None:
-    """Меню управления упражнением."""
     _log_callback(callback)
     exercise_id = int(callback.data.split(":")[-1])
 
@@ -115,10 +120,9 @@ async def view_exercise(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Упражнение не найдено", show_alert=True)
         return
 
-    type_label = "собственный вес" if exercise["is_bodyweight"] else "с весом"
     await callback.message.edit_text(
         f"🏋️ <b>{exercise['name']}</b>\n"
-        f"Тип: {type_label}\n\n"
+        f"Тип: {_type_label(exercise)}\n\n"
         f"Выберите действие:",
         reply_markup=exercise_manage_keyboard(exercise),
     )
@@ -127,7 +131,6 @@ async def view_exercise(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("myex:rename:"))
 async def rename_exercise_start(callback: CallbackQuery, state: FSMContext) -> None:
-    """Запуск переименования упражнения."""
     _log_callback(callback)
     exercise_id = int(callback.data.split(":")[-1])
     await state.set_state(EditExerciseStates.waiting_for_new_name)
@@ -145,7 +148,6 @@ async def rename_exercise_start(callback: CallbackQuery, state: FSMContext) -> N
 
 @router.message(EditExerciseStates.waiting_for_new_name)
 async def rename_exercise_finish(message: Message, state: FSMContext) -> None:
-    """Сохраняет новое название упражнения."""
     user_id = message.from_user.id
     new_name = (message.text or "").strip()
     data = await state.get_data()
@@ -177,11 +179,10 @@ async def rename_exercise_finish(message: Message, state: FSMContext) -> None:
         f"Пользователь {user_id} изменил название упражнения {exercise_id} на '{new_name}'"
     )
 
-    type_label = "собственный вес" if exercise["is_bodyweight"] else "с весом"
     await message.answer(
         f"✅ Название обновлено!\n\n"
         f"🏋️ <b>{exercise['name']}</b>\n"
-        f"Тип: {type_label}\n\n"
+        f"Тип: {_type_label(exercise)}\n\n"
         f"Выберите действие:",
         reply_markup=exercise_manage_keyboard(exercise),
     )
@@ -189,13 +190,12 @@ async def rename_exercise_finish(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("myex:toggle:"))
 async def toggle_exercise_type(callback: CallbackQuery, state: FSMContext) -> None:
-    """Переключает тип упражнения (с весом / собственный вес)."""
     _log_callback(callback)
     user_id = callback.from_user.id
     exercise_id = int(callback.data.split(":")[-1])
 
     try:
-        new_status = await db.toggle_exercise_bodyweight(exercise_id)
+        new_type = await db.cycle_exercise_type(exercise_id)
         exercise = await db.get_exercise_by_id(exercise_id)
     except Exception:
         logger.exception(
@@ -208,13 +208,12 @@ async def toggle_exercise_type(callback: CallbackQuery, state: FSMContext) -> No
 
     logger.info(
         f"Пользователь {user_id} переключил тип упражнения {exercise_id}: "
-        f"новое значение is_bodyweight={int(new_status)}"
+        f"новое значение exercise_type={new_type}"
     )
 
-    type_label = "собственный вес" if exercise["is_bodyweight"] else "с весом"
     await callback.message.edit_text(
         f"🏋️ <b>{exercise['name']}</b>\n"
-        f"Тип: {type_label}\n\n"
+        f"Тип: {_type_label(exercise)}\n\n"
         f"Выберите действие:",
         reply_markup=exercise_manage_keyboard(exercise),
     )

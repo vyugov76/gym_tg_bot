@@ -28,3 +28,18 @@ class EditExerciseStates(StatesGroup):
     """Редактирование упражнения в профиле."""
 
     waiting_for_new_name = State()
+
+
+class ProfileEditStates(StatesGroup):
+    """Редактирование роста и веса в профиле."""
+
+    waiting_for_height = State()
+    waiting_for_weight = State()
+
+
+class WorkoutEditStates(StatesGroup):
+    """Пошаговое редактирование подхода в завершённой тренировке."""
+
+    waiting_for_exercise_number = State()
+    waiting_for_set_number = State()
+    waiting_for_new_value = State()
