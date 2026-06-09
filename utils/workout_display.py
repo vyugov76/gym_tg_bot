@@ -48,13 +48,26 @@ def format_duration(started_at: datetime, finished_at: datetime | None) -> str:
     return f"{minutes} минут"
 
 
+def _set_duration_seconds(set_row: dict) -> int:
+    """Секунды подхода: новое поле duration_seconds или legacy reps."""
+    if set_row.get("duration_seconds") is not None:
+        return int(set_row["duration_seconds"])
+    if set_row.get("reps") is not None:
+        return int(set_row["reps"])
+    return 0
+
+
 def _format_set_parts(exercise_type: int, sets: list[dict]) -> str:
     if exercise_type == EXERCISE_BODYWEIGHT:
-        return " ".join(f"{s['reps']} повт." for s in sets)
+        return " ".join(f"{s['reps']} повт." for s in sets if s.get("reps") is not None)
     if exercise_type == EXERCISE_TIMED:
-        return " ".join(format_exercise_time(int(s["reps"])) for s in sets)
+        return " ".join(
+            format_exercise_time(_set_duration_seconds(s)) for s in sets
+        )
     return " ".join(
-        f"{format_weight(s['weight'])}/{s['reps']}" for s in sets
+        f"{format_weight(s['weight'])}/{s['reps']}"
+        for s in sets
+        if s.get("reps") is not None
     )
 
 
@@ -105,13 +118,28 @@ def format_exercise_lines(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _workout_title_lines(first: dict, selected_date: date | None = None) -> list[str]:
+    """Заголовок отчёта: дата на первой строке, название шаблона — на второй."""
+    if selected_date is not None:
+        date_str = selected_date.strftime("%d.%m.%Y")
+    else:
+        started_at = to_local_datetime(first["started_at"])
+        date_str = started_at.strftime("%d.%m.%Y")
+
+    lines = [f"📅 Тренировка на {date_str}"]
+    preset_name = (first.get("preset_name") or "").strip()
+    if preset_name:
+        lines.append(preset_name)
+    return lines
+
+
 def format_calendar_workout(rows: list[dict], selected_date: date) -> str:
     """Формат детализации для календаря статистики."""
     first = rows[0]
     started_at = to_local_datetime(first["started_at"])
 
     lines = [
-        f"📅 Тренировка на {selected_date.strftime('%d.%m.%Y')}",
+        *_workout_title_lines(first, selected_date),
         f"Начало тренировки: {started_at.strftime('%H:%M')}",
         f"Продолжительность: {format_duration(first['started_at'], first.get('finished_at'))}",
         "",
@@ -127,9 +155,9 @@ def format_finish_workout(rows: list[dict]) -> str:
     duration_str = format_duration(first["started_at"], first.get("finished_at"))
 
     lines = [
-        "🎉 Тренировка завершена! Отличная работа!",
-        f"⏱️ Время: {started_at.strftime('%H:%M')}",
-        f"⏳ Продолжительность: {duration_str}",
+        *_workout_title_lines(first),
+        f"Начало тренировки: {started_at.strftime('%H:%M')}",
+        f"Продолжительность: {duration_str}",
         "",
     ]
     lines.extend(format_exercise_lines(rows))

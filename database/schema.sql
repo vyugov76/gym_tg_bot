@@ -48,3 +48,23 @@ FOREIGN KEY (id_workout_exercise) REFERENCES GTB_workout_exercises(id_workout_ex
 -- поле id_user в таблице упражнений теперь может принимать значение NULL (значит, упражнение общее)
 -- ===================================================================
 ALTER TABLE GTB_workout_exercises ALTER COLUMN id_user INT NULL;
+
+
+-- ===================================================================
+-- 5. СВЯЗЬ ТРЕНИРОВКИ С ШАБЛОНОМ (Вариант Б: id_preset в GTB_workouts)
+-- Идемпотентно: колонка и FK создаются только если ещё не существуют
+-- (повторный запуск безопасен, если колонка уже добавлена, а CONSTRAINT упал).
+-- NO ACTION вместо SET NULL — иначе MS SQL Server 1785 (множественные каскады).
+-- ===================================================================
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('GTB_workouts') AND name = 'id_preset'
+)
+    ALTER TABLE GTB_workouts ADD id_preset INT NULL;
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.foreign_keys
+    WHERE name = 'FK_GTB_workouts_GTB_preset_workouts'
+)
+    ALTER TABLE GTB_workouts ADD CONSTRAINT FK_GTB_workouts_GTB_preset_workouts
+    FOREIGN KEY (id_preset) REFERENCES GTB_preset_workouts(id_preset) ON DELETE NO ACTION;

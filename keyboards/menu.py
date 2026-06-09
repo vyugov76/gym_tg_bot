@@ -286,13 +286,50 @@ def after_set_keyboard(*, preset_mode: bool = False) -> InlineKeyboardMarkup:
     )
 
 
+def preset_program_complete_keyboard() -> InlineKeyboardMarkup:
+    """Экран после выполнения всех упражнений программы."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔄 Другое упражнение",
+                callback_data="set:free_mode",
+            )],
+            [InlineKeyboardButton(
+                text="✅ Завершить тренировку",
+                callback_data="set:finish",
+            )],
+        ]
+    )
+
+
+def template_save_keyboard() -> InlineKeyboardMarkup:
+    """Выбор действия при завершении изменённой тренировки по шаблону."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="💾 Перезаписать текущий шаблон",
+                callback_data="template:overwrite",
+            )],
+            [InlineKeyboardButton(
+                text="➕ Сохранить как новый шаблон",
+                callback_data="template:save_new",
+            )],
+            [InlineKeyboardButton(
+                text="❌ Не сохранять изменения",
+                callback_data="template:skip",
+            )],
+        ]
+    )
+
+
 def my_exercises_keyboard(exercises: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     """Список упражнений пользователя в категории."""
     buttons = []
     for ex in exercises:
         icon = _exercise_icon(ex)
+        shared = "🌐 " if ex.get("id_user") is None else ""
         buttons.append([InlineKeyboardButton(
-            text=f"{icon} {ex['name']}",
+            text=f"{shared}{icon} {ex['name']}",
             callback_data=f"myex:view:{ex['id']}",
         )])
     if not buttons:
@@ -309,8 +346,11 @@ def exercise_manage_keyboard(exercise: dict[str, Any]) -> InlineKeyboardMarkup:
         exercise.get("exercise_type", exercise.get("is_bodyweight", 0))
     )
     toggle_text = NEXT_TYPE_BUTTON[exercise_type]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    is_owned = exercise.get("id_user") is not None
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    if is_owned:
+        buttons.extend([
             [InlineKeyboardButton(
                 text="✏️ Изменить название",
                 callback_data=f"myex:rename:{exercise['id']}",
@@ -320,11 +360,15 @@ def exercise_manage_keyboard(exercise: dict[str, Any]) -> InlineKeyboardMarkup:
                 callback_data=f"myex:toggle:{exercise['id']}",
             )],
             [InlineKeyboardButton(
-                text="◀️ Назад",
-                callback_data="myex:back_ctx",
+                text="❌ Удалить из каталога",
+                callback_data=f"myex:delete:{exercise['id']}",
             )],
-        ]
-    )
+        ])
+    buttons.append([InlineKeyboardButton(
+        text="◀️ Назад",
+        callback_data="myex:back_ctx",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def profile_keyboard() -> InlineKeyboardMarkup:

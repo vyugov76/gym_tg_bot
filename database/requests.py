@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date
 from typing import Any, Literal
 
 import pyodbc
 
-from database.connection import get_pool, refresh_db_pool
+from database.connection import discard_connection, get_pool, refresh_db_pool
 
 logger = logging.getLogger(__name__)
 
 FetchMode = Literal["one", "all", "scalar", "none"]
-MAX_QUERY_ATTEMPTS = 2
+MAX_QUERY_ATTEMPTS = 3
+RETRY_DELAY_SEC = 0.5
 
-_RETRYABLE_DB_ERRORS = (pyodbc.OperationalError, pyodbc.InterfaceError)
+_CONNECTION_ERROR_CODES = frozenset({"08S01", "HYT00", "HYT01", "01000"})
 
 
 async def _fetch_one_dict(cur) -> dict[str, Any] | None:
@@ -32,18 +34,50 @@ async def _fetch_all_dicts(cur) -> list[dict[str, Any]]:
     return [dict(zip(columns, row, strict=False)) for row in rows]
 
 
-def _is_retryable_db_error(exc: BaseException) -> bool:
-    """Проверяет, связана ли ошибка с обрывом соединения."""
-    if isinstance(exc, _RETRYABLE_DB_ERRORS):
+def _error_text(exc: BaseException) -> str:
+    return str(exc).lower()
+
+
+def _is_dead_connection_error(exc: BaseException) -> bool:
+    """Обрыв TCP / протухшее соединение из пула (10054, 08S01, closed connection)."""
+    if isinstance(exc, (pyodbc.OperationalError, pyodbc.InterfaceError)):
         return True
+
+    if isinstance(exc, pyodbc.ProgrammingError):
+        text = _error_text(exc)
+        if "connection has been closed" in text or "closed connection" in text:
+            return True
+
     if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
         return True
+
     if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10054:
         return True
+
+    if isinstance(exc, pyodbc.Error):
+        if exc.args:
+            code = str(exc.args[0])
+            if code in _CONNECTION_ERROR_CODES:
+                return True
+        if "10054" in str(exc) or "08s01" in _error_text(exc):
+            return True
+
     cause = exc.__cause__
-    if cause is not None:
-        return _is_retryable_db_error(cause)
+    if cause is not None and cause is not exc:
+        return _is_dead_connection_error(cause)
+
     return False
+
+
+async def _read_fetch_result(cur, fetch: FetchMode) -> Any:
+    if fetch == "one":
+        return await _fetch_one_dict(cur)
+    if fetch == "all":
+        return await _fetch_all_dicts(cur)
+    if fetch == "scalar":
+        row = await cur.fetchone()
+        return row[0] if row else None
+    return None
 
 
 async def _execute_query(
@@ -51,19 +85,25 @@ async def _execute_query(
     params: tuple,
     fetch: FetchMode,
 ) -> Any:
-    """Одна попытка выполнения запроса через текущий пул."""
+    """Одна попытка: acquire → execute → release (или discard при обрыве)."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    conn = await pool.acquire()
+    try:
         async with conn.cursor() as cur:
             await cur.execute(sql, params)
-            if fetch == "one":
-                return await _fetch_one_dict(cur)
-            if fetch == "all":
-                return await _fetch_all_dicts(cur)
-            if fetch == "scalar":
-                row = await cur.fetchone()
-                return row[0] if row else None
-    return None
+            return await _read_fetch_result(cur, fetch)
+    except Exception as exc:
+        if _is_dead_connection_error(exc):
+            logger.warning(
+                "Протухшее соединение из пула, закрываем: %s",
+                exc,
+            )
+            await discard_connection(conn)
+            conn = None
+        raise
+    finally:
+        if conn is not None:
+            await pool.release(conn)
 
 
 async def _run_query(
@@ -71,7 +111,7 @@ async def _run_query(
     params: tuple = (),
     fetch: FetchMode = "none",
 ) -> Any:
-    """Выполняет SQL-запрос; при обрыве соединения пересоздаёт пул и повторяет."""
+    """Выполняет SQL с повторами при обрыве соединения (до 3 попыток)."""
     last_error: BaseException | None = None
 
     for attempt in range(1, MAX_QUERY_ATTEMPTS + 1):
@@ -85,19 +125,29 @@ async def _run_query(
             )
             return await _execute_query(sql, params, fetch)
         except Exception as exc:
-            if _is_retryable_db_error(exc) and attempt < MAX_QUERY_ATTEMPTS:
+            if not _is_dead_connection_error(exc):
+                logger.exception("Ошибка при работе с БД")
+                raise
+
+            last_error = exc
+            if attempt < MAX_QUERY_ATTEMPTS:
                 logger.warning(
-                    "Соединение с БД потеряно (попытка %s/%s): %s. "
-                    "Пересоздаём пул и повторяем запрос...",
+                    "Обрыв соединения с БД (попытка %s/%s): %s. "
+                    "Обновляем пул, пауза %.1f с и повтор...",
                     attempt,
                     MAX_QUERY_ATTEMPTS,
                     exc,
+                    RETRY_DELAY_SEC,
                 )
-                last_error = exc
                 await refresh_db_pool()
+                await asyncio.sleep(RETRY_DELAY_SEC)
                 continue
 
-            logger.exception("Ошибка при работе с БД")
+            logger.error(
+                "Запрос не выполнен после %s попыток: %s",
+                MAX_QUERY_ATTEMPTS,
+                exc,
+            )
             raise
 
     if last_error is not None:
@@ -114,6 +164,22 @@ def _normalize_exercise_row(row: dict[str, Any]) -> dict[str, Any]:
     row["is_bodyweight"] = _as_exercise_type(row["is_bodyweight"])
     row["exercise_type"] = row["is_bodyweight"]
     return row
+
+
+# Фильтр каталога: свои + админские, без удалённых
+_CATALOG_WHERE = """
+    (id_user = ? OR id_user IS NULL)
+    AND workout_id IS NULL
+    AND is_deleted = 0
+"""
+
+_SET_DETAIL_COLUMNS = """
+    s.set_number,
+    s.weight,
+    s.reps,
+    s.duration_seconds,
+    s.distance_meters
+"""
 
 
 # --- Пользователи ---
@@ -223,6 +289,7 @@ async def bulk_assign_exercises_to_category(
         WHERE id_workout_exercise IN ({placeholders})
           AND id_user = ?
           AND workout_id IS NULL
+          AND is_deleted = 0
           AND category_id IS NULL
         """,
         (category_id, *exercise_ids, id_user),
@@ -247,6 +314,7 @@ async def bulk_unassign_exercises_from_category(
           AND id_user = ?
           AND category_id = ?
           AND workout_id IS NULL
+          AND is_deleted = 0
         """,
         (*exercise_ids, id_user, category_id),
     )
@@ -269,14 +337,15 @@ async def delete_category(category_id: int, user_id: int) -> None:
 
 async def get_global_exercises_by_user_id(user_id: int) -> list[dict[str, Any]]:
     rows = await _run_query(
-        """
+        f"""
         SELECT
             id_workout_exercise AS id,
             exercise_name AS name,
             is_bodyweight,
-            category_id
+            category_id,
+            id_user
         FROM GTB_workout_exercises
-        WHERE id_user = ? AND workout_id IS NULL
+        WHERE {_CATALOG_WHERE}
         ORDER BY exercise_name
         """,
         (user_id,),
@@ -295,10 +364,12 @@ async def get_exercises_by_category(
             id_workout_exercise AS id,
             exercise_name AS name,
             is_bodyweight,
-            category_id
+            category_id,
+            id_user
         FROM GTB_workout_exercises
-        WHERE id_user = ?
+        WHERE (id_user = ? OR id_user IS NULL)
           AND workout_id IS NULL
+          AND is_deleted = 0
           AND category_id = ?
         ORDER BY exercise_name
         """,
@@ -310,15 +381,15 @@ async def get_exercises_by_category(
 
 async def get_unsorted_exercises(user_id: int) -> list[dict[str, Any]]:
     rows = await _run_query(
-        """
+        f"""
         SELECT
             id_workout_exercise AS id,
             exercise_name AS name,
             is_bodyweight,
-            category_id
+            category_id,
+            id_user
         FROM GTB_workout_exercises
-        WHERE id_user = ?
-          AND workout_id IS NULL
+        WHERE {_CATALOG_WHERE}
           AND category_id IS NULL
         ORDER BY exercise_name
         """,
@@ -337,9 +408,11 @@ async def get_exercise_by_id(exercise_id: int) -> dict[str, Any] | None:
             exercise_name AS name,
             is_bodyweight,
             category_id,
-            workout_id
+            workout_id,
+            is_deleted
         FROM GTB_workout_exercises
         WHERE id_workout_exercise = ?
+          AND (workout_id IS NOT NULL OR is_deleted = 0)
         """,
         (exercise_id,),
         fetch="one",
@@ -356,9 +429,9 @@ async def add_global_exercise(
     exercise_id = await _run_query(
         """
         INSERT INTO GTB_workout_exercises
-            (workout_id, id_user, exercise_name, is_bodyweight, category_id)
+            (workout_id, id_user, exercise_name, is_bodyweight, category_id, is_deleted)
         OUTPUT INSERTED.id_workout_exercise
-        VALUES (NULL, ?, ?, ?, ?)
+        VALUES (NULL, ?, ?, ?, ?, 0)
         """,
         (user_id, exercise_name, exercise_type, category_id),
         fetch="scalar",
@@ -372,9 +445,26 @@ async def update_exercise_name(exercise_id: int, new_name: str) -> None:
         UPDATE GTB_workout_exercises
         SET exercise_name = ?
         WHERE id_workout_exercise = ? AND workout_id IS NULL
+          AND id_user IS NOT NULL AND is_deleted = 0
         """,
         (new_name, exercise_id),
     )
+
+
+async def soft_delete_global_exercise(exercise_id: int, id_user: int) -> bool:
+    """Мягкое удаление упражнения из каталога пользователя."""
+    await _run_query(
+        """
+        UPDATE GTB_workout_exercises
+        SET is_deleted = 1
+        WHERE id_workout_exercise = ?
+          AND id_user = ?
+          AND workout_id IS NULL
+          AND is_deleted = 0
+        """,
+        (exercise_id, id_user),
+    )
+    return True
 
 
 async def cycle_exercise_type(exercise_id: int) -> int:
@@ -389,6 +479,7 @@ async def cycle_exercise_type(exercise_id: int) -> int:
         UPDATE GTB_workout_exercises
         SET is_bodyweight = ?
         WHERE id_workout_exercise = ? AND workout_id IS NULL
+          AND id_user IS NOT NULL AND is_deleted = 0
         """,
         (new_value, exercise_id),
     )
@@ -408,7 +499,7 @@ async def get_presets_by_user_id(user_id: int) -> list[dict[str, Any]]:
         """
         SELECT id_preset AS id, preset_name AS name
         FROM GTB_preset_workouts
-        WHERE id_user = ?
+        WHERE id_user = ? AND is_deleted = 0
         ORDER BY preset_name
         """,
         (user_id,),
@@ -421,7 +512,7 @@ async def get_preset_by_id(preset_id: int) -> dict[str, Any] | None:
         """
         SELECT id_preset AS id, id_user, preset_name AS name
         FROM GTB_preset_workouts
-        WHERE id_preset = ?
+        WHERE id_preset = ? AND is_deleted = 0
         """,
         (preset_id,),
         fetch="one",
@@ -449,9 +540,9 @@ async def get_preset_exercises(preset_id: int) -> list[dict[str, Any]]:
 async def create_preset(user_id: int, preset_name: str) -> int:
     preset_id = await _run_query(
         """
-        INSERT INTO GTB_preset_workouts (id_user, preset_name)
+        INSERT INTO GTB_preset_workouts (id_user, preset_name, is_deleted)
         OUTPUT INSERTED.id_preset
-        VALUES (?, ?)
+        VALUES (?, ?, 0)
         """,
         (user_id, preset_name),
         fetch="scalar",
@@ -490,11 +581,10 @@ async def bulk_add_global_exercises_to_preset(
     added = 0
     for exercise_id in global_exercise_ids:
         exercise = await get_exercise_by_id(exercise_id)
-        if (
-            not exercise
-            or exercise.get("workout_id") is not None
-            or exercise.get("id_user") != id_user
-        ):
+        if not exercise or exercise.get("workout_id") is not None:
+            continue
+        ex_owner = exercise.get("id_user")
+        if ex_owner is not None and ex_owner != id_user:
             continue
         sequence += 1
         await add_preset_exercise(
@@ -552,11 +642,12 @@ async def add_preset_exercise(
 
 
 async def delete_preset(preset_id: int, user_id: int) -> None:
-    """Удаляет шаблон. Исторические GTB_workouts не затрагиваются."""
+    """Мягкое удаление шаблона. Исторические GTB_workouts не затрагиваются."""
     await _run_query(
         """
-        DELETE FROM GTB_preset_workouts
-        WHERE id_preset = ? AND id_user = ?
+        UPDATE GTB_preset_workouts
+        SET is_deleted = 1
+        WHERE id_preset = ? AND id_user = ? AND is_deleted = 0
         """,
         (preset_id, user_id),
     )
@@ -589,6 +680,15 @@ async def create_preset_from_workout(
     workout_id: int,
 ) -> int:
     preset_id = await create_preset(user_id, preset_name)
+    await copy_workout_exercises_to_preset(preset_id, workout_id)
+    return preset_id
+
+
+async def copy_workout_exercises_to_preset(
+    preset_id: int,
+    workout_id: int,
+) -> int:
+    """Копирует упражнения тренировки в шаблон (порядок первого появления)."""
     exercises = await get_unique_workout_exercises_ordered(workout_id)
     for seq, exercise in enumerate(exercises, start=1):
         await add_preset_exercise(
@@ -597,20 +697,40 @@ async def create_preset_from_workout(
             exercise_type=exercise["is_bodyweight"],
             sequence_number=seq,
         )
-    return preset_id
+    return len(exercises)
+
+
+async def replace_preset_exercises_from_workout(
+    preset_id: int,
+    user_id: int,
+    workout_id: int,
+) -> int:
+    """Перезаписывает упражнения шаблона списком из завершённой тренировки."""
+    preset = await get_preset_by_id(preset_id)
+    if not preset or preset["id_user"] != user_id:
+        raise ValueError("Шаблон не найден или нет доступа")
+
+    await _run_query(
+        """
+        DELETE FROM GTB_preset_exercises
+        WHERE id_preset = ?
+        """,
+        (preset_id,),
+    )
+    return await copy_workout_exercises_to_preset(preset_id, workout_id)
 
 
 # --- Тренировки ---
 
 
-async def create_workout(user_id: int) -> int:
+async def create_workout(user_id: int, id_preset: int | None = None) -> int:
     workout_id = await _run_query(
         """
-        INSERT INTO GTB_workouts (id_user)
+        INSERT INTO GTB_workouts (id_user, id_preset)
         OUTPUT INSERTED.id_workout
-        VALUES (?)
+        VALUES (?, ?)
         """,
-        (user_id,),
+        (user_id, id_preset),
         fetch="scalar",
     )
     return int(workout_id)
@@ -639,16 +759,27 @@ async def add_workout_exercise(
 async def add_set(
     workout_exercise_id: int,
     set_number: int,
-    reps: int,
+    *,
+    reps: int | None = None,
     weight: float | None = None,
+    duration_seconds: int | None = None,
+    distance_meters: int | None = None,
 ) -> int:
     set_id = await _run_query(
         """
-        INSERT INTO GTB_sets (id_workout_exercise, set_number, weight, reps)
+        INSERT INTO GTB_sets
+            (id_workout_exercise, set_number, weight, reps, duration_seconds, distance_meters)
         OUTPUT INSERTED.id_set
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (workout_exercise_id, set_number, weight, reps),
+        (
+            workout_exercise_id,
+            set_number,
+            weight,
+            reps,
+            duration_seconds,
+            distance_meters,
+        ),
         fetch="scalar",
     )
     return int(set_id)
@@ -763,18 +894,20 @@ async def get_detailed_workouts_by_date(
     Фильтр по CAST(w.started_at AS DATE). user_id — внутренний id_user.
     """
     rows = await _run_query(
-        """
+        f"""
         SELECT
             w.id_workout,
             w.started_at,
             w.finished_at,
+            w.id_preset,
+            pw.preset_name,
             we.id_workout_exercise,
             we.exercise_name,
             we.is_bodyweight,
-            s.set_number,
-            s.weight,
-            s.reps
+            {_SET_DETAIL_COLUMNS}
         FROM GTB_workouts w
+        LEFT JOIN GTB_preset_workouts pw
+            ON pw.id_preset = w.id_preset
         INNER JOIN GTB_workout_exercises we
             ON we.workout_id = w.id_workout
         LEFT JOIN GTB_sets s
@@ -832,6 +965,20 @@ async def delete_workout(workout_id: int) -> None:
     )
 
 
+async def get_set_count(workout_exercise_id: int) -> int:
+    """Количество подходов в упражнении тренировки."""
+    count = await _run_query(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM GTB_sets
+        WHERE id_workout_exercise = ?
+        """,
+        (workout_exercise_id,),
+        fetch="scalar",
+    )
+    return int(count or 0)
+
+
 async def get_set_by_number(
     workout_exercise_id: int,
     set_number: int,
@@ -839,7 +986,7 @@ async def get_set_by_number(
     """Возвращает подход по номеру внутри упражнения."""
     return await _run_query(
         """
-        SELECT id_set AS id, set_number, weight, reps
+        SELECT id_set AS id, set_number, weight, reps, duration_seconds, distance_meters
         FROM GTB_sets
         WHERE id_workout_exercise = ? AND set_number = ?
         """,
@@ -850,35 +997,40 @@ async def get_set_by_number(
 
 async def update_set(
     set_id: int,
-    reps: int,
+    *,
+    reps: int | None = None,
     weight: float | None = None,
+    duration_seconds: int | None = None,
+    distance_meters: int | None = None,
 ) -> None:
-    """Обновляет weight и reps подхода."""
+    """Обновляет поля подхода."""
     await _run_query(
         """
         UPDATE GTB_sets
-        SET weight = ?, reps = ?
+        SET weight = ?, reps = ?, duration_seconds = ?, distance_meters = ?
         WHERE id_set = ?
         """,
-        (weight, reps, set_id),
+        (weight, reps, duration_seconds, distance_meters, set_id),
     )
 
 
 async def get_workout_detail_by_id(workout_id: int) -> list[dict[str, Any]]:
     """Детальная информация о конкретной завершённой тренировке."""
     rows = await _run_query(
-        """
+        f"""
         SELECT
             w.id_workout,
             w.started_at,
             w.finished_at,
+            w.id_preset,
+            pw.preset_name,
             we.id_workout_exercise,
             we.exercise_name,
             we.is_bodyweight,
-            s.set_number,
-            s.weight,
-            s.reps
+            {_SET_DETAIL_COLUMNS}
         FROM GTB_workouts w
+        LEFT JOIN GTB_preset_workouts pw
+            ON pw.id_preset = w.id_preset
         INNER JOIN GTB_workout_exercises we
             ON we.workout_id = w.id_workout
         LEFT JOIN GTB_sets s

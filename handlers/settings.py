@@ -121,6 +121,19 @@ async def _load_bulk_exercises(
     return []
 
 
+async def _filter_owned_exercise_ids(
+    exercise_ids: list[int],
+    id_user: int,
+) -> list[int]:
+    """Оставляет только упражнения, принадлежащие пользователю (не админские)."""
+    owned: list[int] = []
+    for exercise_id in exercise_ids:
+        exercise = await db.get_exercise_by_id(exercise_id)
+        if exercise and exercise.get("id_user") == id_user:
+            owned.append(exercise_id)
+    return owned
+
+
 def _bulk_title(mode: str, context_name: str) -> str:
     titles = {
         "cat_add": f"➕ Добавление в «{context_name}»\n\nОтметьте несортированные упражнения:",
@@ -662,8 +675,15 @@ async def bulk_confirm(callback: CallbackQuery, state: FSMContext) -> None:
 
     try:
         if mode == "cat_add":
+            owned_ids = await _filter_owned_exercise_ids(selected, user["id"])
+            if not owned_ids:
+                await callback.answer(
+                    "Можно добавлять в категорию только свои упражнения",
+                    show_alert=True,
+                )
+                return
             count = await db.bulk_assign_exercises_to_category(
-                selected, context_id, user["id"]
+                owned_ids, context_id, user["id"]
             )
             await _render_category_view(
                 callback,

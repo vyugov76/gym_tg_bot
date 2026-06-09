@@ -35,7 +35,9 @@ _pool: aioodbc.Pool | None = None
 POOL_MINSIZE = 1
 POOL_MAXSIZE = 10
 
-# ... дальше твои функции build_dsn(), init_db() и остальные идут без изменений ...
+# Таймауты ODBC: не ждать ответа от «мёртвого» сокета ~20 сек
+ODBC_CONNECTION_TIMEOUT = 5
+ODBC_QUERY_TIMEOUT = 5
 
 
 def build_dsn() -> str:
@@ -47,6 +49,8 @@ def build_dsn() -> str:
         f"UID={DB_USER};"
         f"PWD={DB_PASSWORD};"
         "TrustServerCertificate=yes;"
+        f"Connection Timeout={ODBC_CONNECTION_TIMEOUT};"
+        f"Timeout={ODBC_QUERY_TIMEOUT};"
     )
 
 
@@ -58,6 +62,42 @@ async def _create_pool() -> aioodbc.Pool:
         maxsize=POOL_MAXSIZE,
         autocommit=True,
     )
+
+
+_SCHEMA_MIGRATIONS: tuple[str, ...] = (
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('GTB_workouts') AND name = 'id_preset'
+    )
+        ALTER TABLE GTB_workouts ADD id_preset INT NULL
+    """,
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.foreign_keys
+        WHERE name = 'FK_GTB_workouts_GTB_preset_workouts'
+    )
+        ALTER TABLE GTB_workouts ADD CONSTRAINT FK_GTB_workouts_GTB_preset_workouts
+        FOREIGN KEY (id_preset) REFERENCES GTB_preset_workouts(id_preset)
+        ON DELETE NO ACTION
+    """,
+)
+
+
+async def apply_schema_migrations() -> None:
+    """Применяет идемпотентные миграции схемы (вызывается при старте бота)."""
+    pool = get_pool()
+    conn = await pool.acquire()
+    try:
+        async with conn.cursor() as cur:
+            for sql in _SCHEMA_MIGRATIONS:
+                await cur.execute(sql)
+        logger.info("Миграции схемы БД применены успешно")
+    except Exception:
+        logger.exception("Ошибка применения миграций схемы БД")
+        raise
+    finally:
+        await pool.release(conn)
 
 
 async def _close_pool(pool: aioodbc.Pool | None) -> None:
@@ -92,6 +132,7 @@ async def init_db() -> None:
                 POOL_MINSIZE,
                 POOL_MAXSIZE,
             )
+            await apply_schema_migrations()
             return
         except Exception as e:
             last_error = e
@@ -133,3 +174,17 @@ def get_pool() -> aioodbc.Pool:
     if _pool is None:
         raise RuntimeError("Пул БД не инициализирован. Вызовите init_db() перед работой.")
     return _pool
+
+
+async def discard_connection(conn) -> None:
+    """
+    Закрывает протухшее соединение, не возвращая его в пул.
+    Вызывать при OperationalError / ProgrammingError об обрыве связи.
+    """
+    try:
+        await conn.close()
+    except Exception:
+        logger.debug(
+            "Не удалось корректно закрыть проблемное соединение",
+            exc_info=True,
+        )

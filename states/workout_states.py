@@ -15,6 +15,7 @@ class WorkoutStates(StatesGroup):
 
     choosing_exercise = State()
     entering_set = State()
+    waiting_for_template_name = State()
 
 
 class ExerciseStates(StatesGroup):

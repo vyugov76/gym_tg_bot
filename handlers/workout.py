@@ -12,6 +12,8 @@ from keyboards.menu import (
     exercise_category_keyboard,
     exercise_type_keyboard,
     main_menu_keyboard,
+    preset_program_complete_keyboard,
+    template_save_keyboard,
     workout_categories_keyboard,
     workout_exercises_keyboard,
     workout_preset_list_keyboard,
@@ -98,7 +100,10 @@ async def _init_workout_state(
     preset_id: int | None = None,
     preset_queue: list[dict] | None = None,
 ) -> int:
-    workout_id = await db.create_workout(user["id"])
+    workout_id = await db.create_workout(
+        user["id"],
+        id_preset=preset_id if preset_mode else None,
+    )
     await state.update_data(
         workout_id=workout_id,
         set_number=1,
@@ -113,8 +118,60 @@ async def _init_workout_state(
         preset_index=0,
         empty_workout=not preset_mode,
         browse_category_id=None,
+        is_preset_modified=False,
     )
     return workout_id
+
+
+def _preset_exercise_keys(preset_queue: list[dict]) -> set[tuple[str, int]]:
+    return {(ex["name"], ex["exercise_type"]) for ex in preset_queue}
+
+
+async def _mark_preset_modified_if_needed(
+    state: FSMContext,
+    exercise_name: str,
+    exercise_type: int,
+) -> None:
+    """Взводит флаг, если упражнение не входило в исходный шаблон."""
+    data = await state.get_data()
+    preset_queue = data.get("preset_queue", [])
+    if not data.get("preset_id") or not preset_queue:
+        return
+    if (exercise_name, exercise_type) not in _preset_exercise_keys(preset_queue):
+        await state.update_data(is_preset_modified=True)
+
+
+async def _complete_workout_and_show_report(
+    callback: CallbackQuery,
+    state: FSMContext,
+    workout_id: int,
+    data: dict,
+) -> None:
+    """Завершает тренировку в БД и показывает отчёт."""
+    try:
+        await db.finish_workout(workout_id)
+        rows = await db.get_workout_detail_by_id(workout_id)
+    except Exception:
+        logger.exception("Не удалось завершить тренировку: workout_id=%s", workout_id)
+        await callback.answer("Ошибка при сохранении тренировки", show_alert=True)
+        return
+
+    empty_workout = bool(data.get("empty_workout"))
+    has_exercises = bool(rows)
+    show_save = empty_workout and has_exercises
+
+    await state.clear()
+
+    if rows:
+        report = format_finish_workout(rows)
+    else:
+        report = "🎉 Тренировка завершена! Отличная работа!"
+
+    await callback.message.edit_text(
+        report,
+        reply_markup=workout_report_keyboard(workout_id, show_save_preset=show_save),
+    )
+    await callback.answer("Тренировка сохранена!")
 
 
 async def _show_workout_categories(
@@ -208,6 +265,8 @@ async def _start_workout_exercise(
         category_id=category_id,
     )
 
+    await _mark_preset_modified_if_needed(state, exercise_name, exercise_type)
+
     await state.update_data(
         workout_exercise_id=workout_exercise_id,
         exercise_name=exercise_name,
@@ -233,17 +292,11 @@ async def _start_next_preset_exercise(
     preset_index = data.get("preset_index", 0)
 
     if preset_index >= len(preset_queue):
-        await callback.message.answer(
-            "✅ Все упражнения программы выполнены!\n"
-            "Можете завершить тренировку или продолжить в свободном режиме.",
-            reply_markup=after_set_keyboard(preset_mode=False),
-        )
         await state.update_data(preset_mode=False)
-        await _show_workout_categories(
-            callback,
-            state,
-            data["db_user_id"],
-            callback.from_user.id,
+        await callback.message.edit_text(
+            "✅ Все упражнения программы выполнены! "
+            "Вы можете завершить тренировку или продолжить в свободном режиме.",
+            reply_markup=preset_program_complete_keyboard(),
         )
         return False
 
@@ -580,9 +633,8 @@ async def next_exercise(callback: CallbackQuery, state: FSMContext) -> None:
         await state.update_data(db_user_id=db_user_id)
 
     if data.get("preset_mode"):
-        started = await _start_next_preset_exercise(callback, state)
-        if started:
-            await callback.answer()
+        await _start_next_preset_exercise(callback, state)
+        await callback.answer()
         return
 
     browse_category_id = data.get("browse_category_id")
@@ -603,6 +655,33 @@ async def next_exercise(callback: CallbackQuery, state: FSMContext) -> None:
             callback.from_user.id,
             edit=True,
         )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "set:free_mode")
+async def enter_free_mode_after_preset(callback: CallbackQuery, state: FSMContext) -> None:
+    """Свободный режим после завершения программы шаблона."""
+    _log_callback(callback)
+    data = await state.get_data()
+    db_user_id = data.get("db_user_id")
+
+    if not db_user_id:
+        user = await db.get_user_by_telegram_id(callback.from_user.id)
+        if not user:
+            await callback.answer("Сначала нажмите /start", show_alert=True)
+            return
+        db_user_id = user["id"]
+        await state.update_data(db_user_id=db_user_id)
+
+    await state.update_data(is_preset_modified=True, preset_mode=False)
+    await _show_workout_categories(
+        callback,
+        state,
+        db_user_id,
+        callback.from_user.id,
+        edit=True,
+        header="🏋️ Выберите категорию упражнений:",
+    )
     await callback.answer()
 
 
@@ -674,25 +753,36 @@ async def process_set(message: Message, state: FSMContext) -> None:
             await message.answer(INVALID_REPS_MSG)
             return
     elif exercise_type == EXERCISE_TIMED:
-        reps = parse_time_input(message.text)
-        if reps is None:
+        duration_seconds = parse_time_input(message.text)
+        if duration_seconds is None:
             await message.answer(INVALID_TIME_MSG)
             return
         weight = None
+        reps = None
     else:
         parsed = parse_weighted_set(message.text)
         if parsed is None:
             await message.answer(INVALID_WEIGHTED_MSG)
             return
         weight, reps = parsed
+        duration_seconds = None
 
     try:
-        await db.add_set(
-            workout_exercise_id=data["workout_exercise_id"],
-            set_number=set_number,
-            weight=weight,
-            reps=reps,
-        )
+        if exercise_type == EXERCISE_TIMED:
+            await db.add_set(
+                workout_exercise_id=data["workout_exercise_id"],
+                set_number=set_number,
+                weight=None,
+                reps=None,
+                duration_seconds=duration_seconds,
+            )
+        else:
+            await db.add_set(
+                workout_exercise_id=data["workout_exercise_id"],
+                set_number=set_number,
+                weight=weight,
+                reps=reps,
+            )
     except Exception:
         logger.exception("Не удалось сохранить подход: set_number=%s", set_number)
         await message.answer("Не удалось сохранить подход. Попробуйте ещё раз.")
@@ -703,7 +793,9 @@ async def process_set(message: Message, state: FSMContext) -> None:
     if exercise_type == EXERCISE_BODYWEIGHT:
         result_text = f"✅ Подход {set_number} записан: {reps} повторений (собственный вес)"
     elif exercise_type == EXERCISE_TIMED:
-        result_text = f"✅ Подход {set_number} записан: {format_exercise_time(reps)}"
+        result_text = (
+            f"✅ Подход {set_number} записан: {format_exercise_time(duration_seconds)}"
+        )
     else:
         result_text = f"✅ Подход {set_number} записан: {weight} кг × {reps}"
 
@@ -724,17 +816,130 @@ async def finish_workout(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Активная тренировка не найдена", show_alert=True)
         return
 
+    preset_id = data.get("preset_id")
+    if preset_id and data.get("is_preset_modified"):
+        await callback.message.edit_text(
+            "Вы добавили новые упражнения в процессе тренировки. "
+            "Хотите обновить шаблон?",
+            reply_markup=template_save_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    await _complete_workout_and_show_report(callback, state, workout_id, data)
+
+
+@router.callback_query(F.data == "template:overwrite")
+async def template_overwrite(callback: CallbackQuery, state: FSMContext) -> None:
+    _log_callback(callback)
+    data = await state.get_data()
+    workout_id = data.get("workout_id")
+    preset_id = data.get("preset_id")
+    db_user_id = data.get("db_user_id")
+
+    if not workout_id or not preset_id or not db_user_id:
+        await callback.answer("Данные тренировки потеряны", show_alert=True)
+        return
+
+    try:
+        count = await db.replace_preset_exercises_from_workout(
+            preset_id, db_user_id, workout_id
+        )
+    except ValueError:
+        await callback.answer("Шаблон не найден", show_alert=True)
+        return
+    except Exception:
+        logger.exception(
+            "Ошибка перезаписи шаблона: preset_id=%s workout_id=%s",
+            preset_id,
+            workout_id,
+        )
+        await callback.answer("Не удалось обновить шаблон", show_alert=True)
+        return
+
+    logger.info(
+        "Шаблон перезаписан: preset_id=%s workout_id=%s exercises=%s",
+        preset_id,
+        workout_id,
+        count,
+    )
+    await _complete_workout_and_show_report(callback, state, workout_id, data)
+
+
+@router.callback_query(F.data == "template:save_new")
+async def template_save_new_start(callback: CallbackQuery, state: FSMContext) -> None:
+    _log_callback(callback)
+    data = await state.get_data()
+    if not data.get("workout_id"):
+        await callback.answer("Данные тренировки потеряны", show_alert=True)
+        return
+
+    await _transition_state(
+        state,
+        callback.from_user.id,
+        WorkoutStates.waiting_for_template_name,
+    )
+    await callback.message.edit_text(
+        "Введите название для нового шаблона (например, День Ног):"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "template:skip")
+async def template_skip(callback: CallbackQuery, state: FSMContext) -> None:
+    _log_callback(callback)
+    data = await state.get_data()
+    workout_id = data.get("workout_id")
+
+    if not workout_id:
+        await callback.answer("Данные тренировки потеряны", show_alert=True)
+        return
+
+    await _complete_workout_and_show_report(callback, state, workout_id, data)
+
+
+@router.message(WorkoutStates.waiting_for_template_name)
+async def template_save_new_finish(message: Message, state: FSMContext) -> None:
+    name = (message.text or "").strip()
+    if not name or len(name) > 100:
+        await message.answer("Введите название от 1 до 100 символов:")
+        return
+
+    data = await state.get_data()
+    workout_id = data.get("workout_id")
+    db_user_id = data.get("db_user_id")
+
+    if not workout_id or not db_user_id:
+        await state.clear()
+        await message.answer("Данные тренировки потеряны. Начните заново.")
+        return
+
+    try:
+        preset_id = await db.create_preset_from_workout(db_user_id, name, workout_id)
+        exercises = await db.get_preset_exercises(preset_id)
+    except Exception:
+        logger.exception(
+            "Ошибка сохранения нового шаблона: user_id=%s workout_id=%s",
+            message.from_user.id,
+            workout_id,
+        )
+        await message.answer("Не удалось сохранить шаблон. Попробуйте позже.")
+        return
+
+    logger.info(
+        "Новый шаблон из тренировки: preset_id=%s workout_id=%s name=%r",
+        preset_id,
+        workout_id,
+        name,
+    )
+
     try:
         await db.finish_workout(workout_id)
         rows = await db.get_workout_detail_by_id(workout_id)
     except Exception:
         logger.exception("Не удалось завершить тренировку: workout_id=%s", workout_id)
-        await callback.answer("Ошибка при сохранении тренировки", show_alert=True)
+        await message.answer("Шаблон сохранён, но тренировка не завершена. Попробуйте позже.")
         return
-
-    empty_workout = bool(data.get("empty_workout"))
-    has_exercises = bool(rows)
-    show_save = empty_workout and has_exercises
 
     await state.clear()
 
@@ -743,11 +948,10 @@ async def finish_workout(callback: CallbackQuery, state: FSMContext) -> None:
     else:
         report = "🎉 Тренировка завершена! Отличная работа!"
 
-    await callback.message.edit_text(
-        report,
-        reply_markup=workout_report_keyboard(workout_id, show_save_preset=show_save),
+    await message.answer(
+        f"✅ Шаблон <b>{name}</b> сохранён! Упражнений: {len(exercises)}\n\n{report}",
+        reply_markup=workout_report_keyboard(workout_id, show_save_preset=False),
     )
-    await callback.answer("Тренировка сохранена!")
 
 
 @router.callback_query(F.data.regexp(r"^preset:save:\d+$"))

@@ -63,8 +63,21 @@ async def _verify_workout_access(
     return user, None
 
 
-def _detect_report_style(message_text: str | None) -> str:
-    if message_text and message_text.startswith("📅"):
+def _detect_report_style(
+    message_text: str | None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> str:
+    """
+    Определяет источник отчёта для восстановления клавиатуры после редактирования.
+    Календарь: кнопка «Назад в календарь» или legacy-заголовок с 📆.
+    Отчёт после завершения тоже начинается с «📅 Тренировка на», но без этой кнопки.
+    """
+    if reply_markup and reply_markup.inline_keyboard:
+        for row in reply_markup.inline_keyboard:
+            for button in row:
+                if (button.callback_data or "").startswith("stats:back_calendar:"):
+                    return "calendar"
+    if message_text and message_text.startswith("📆"):
         return "calendar"
     return "finish"
 
@@ -355,7 +368,10 @@ async def start_edit_workout(callback: CallbackQuery, state: FSMContext) -> None
         )
         return
 
-    report_style = _detect_report_style(callback.message.text)
+    report_style = _detect_report_style(
+        callback.message.text,
+        callback.message.reply_markup,
+    )
     calendar_date = None
     if rows:
         calendar_date = to_local_datetime(rows[0]["started_at"]).date()
@@ -399,15 +415,30 @@ async def edit_workout_exercise_number(message: Message, state: FSMContext) -> N
         return
 
     exercise = exercises[exercise_number - 1]
+    try:
+        set_count = await db.get_set_count(exercise["id"])
+    except Exception:
+        logger.exception(
+            "Ошибка подсчёта подходов: workout_exercise_id=%s",
+            exercise["id"],
+        )
+        await message.answer("Не удалось загрузить данные. Попробуйте позже.")
+        return
+
     await state.update_data(
         workout_exercise_id=exercise["id"],
         exercise_type=exercise["exercise_type"],
         exercise_name=exercise["name"],
+        is_new_set=False,
     )
     await state.set_state(WorkoutEditStates.waiting_for_set_number)
+    if set_count == 1:
+        range_hint = "1 — изменить, 2 — добавить новый"
+    else:
+        range_hint = f"1–{set_count} — изменить, {set_count + 1} — добавить новый"
     await message.answer(
-        f"В упражнении «{exercise['name']}» введите номер подхода, "
-        f"который хотите изменить (например, 2):"
+        f"В упражнении «{exercise['name']}» введите номер подхода "
+        f"({range_hint}):"
     )
 
 
@@ -418,8 +449,49 @@ async def edit_workout_set_number(message: Message, state: FSMContext) -> None:
     workout_exercise_id = data["workout_exercise_id"]
     exercise_type = data["exercise_type"]
 
+    if set_number is None or set_number < 1:
+        await message.answer("Введите положительное число — номер подхода:")
+        return
+
     try:
-        set_row = await db.get_set_by_number(workout_exercise_id, set_number or -1)
+        set_count = await db.get_set_count(workout_exercise_id)
+    except Exception:
+        logger.exception(
+            "Ошибка подсчёта подходов: workout_exercise_id=%s",
+            workout_exercise_id,
+        )
+        await message.answer("Не удалось загрузить данные. Попробуйте позже.")
+        return
+
+    if set_number > set_count + 1:
+        await message.answer(
+            f"Нельзя перескакивать через подходы. Вы можете выбрать существующий "
+            f"подход (1–{set_count}) или добавить новый, введя {set_count + 1}."
+        )
+        return
+
+    if set_number == set_count + 1:
+        await state.update_data(
+            is_new_set=True,
+            set_number=set_number,
+            set_id=None,
+        )
+        await state.set_state(WorkoutEditStates.waiting_for_new_value)
+
+        if exercise_type == EXERCISE_BODYWEIGHT:
+            prompt = "Введите количество повторений для нового подхода (например, 12):"
+        elif exercise_type == EXERCISE_TIMED:
+            prompt = "Введите время выполнения для нового подхода (например, 45 или 1:15):"
+        else:
+            prompt = (
+                "Введите вес/повторения для нового подхода "
+                "(например, 75/10):"
+            )
+        await message.answer(prompt)
+        return
+
+    try:
+        set_row = await db.get_set_by_number(workout_exercise_id, set_number)
     except Exception:
         logger.exception(
             "Ошибка загрузки подхода: workout_exercise_id=%s set_number=%s",
@@ -429,14 +501,19 @@ async def edit_workout_set_number(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось загрузить подход. Попробуйте позже.")
         return
 
-    if set_number is None or set_row is None:
+    if set_row is None:
         await message.answer(
             f"Подход с номером {message.text!r} не найден.\n"
-            "Введите существующий номер подхода:"
+            f"Введите существующий подход (1–{set_count}) "
+            f"или {set_count + 1} для добавления нового:"
         )
         return
 
-    await state.update_data(set_id=set_row["id"], set_number=set_number)
+    await state.update_data(
+        is_new_set=False,
+        set_id=set_row["id"],
+        set_number=set_number,
+    )
     await state.set_state(WorkoutEditStates.waiting_for_new_value)
 
     if exercise_type == EXERCISE_BODYWEIGHT:
@@ -452,11 +529,15 @@ async def edit_workout_set_number(message: Message, state: FSMContext) -> None:
 async def edit_workout_new_value(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     exercise_type = data["exercise_type"]
-    set_id = data["set_id"]
     workout_id = data["workout_id"]
+    is_new_set = bool(data.get("is_new_set"))
+    set_number = data.get("set_number")
+    workout_exercise_id = data.get("workout_exercise_id")
+    set_id = data.get("set_id")
 
     weight: float | None = None
     reps: int | None = None
+    duration_seconds: int | None = None
 
     if exercise_type == EXERCISE_BODYWEIGHT:
         reps = parse_bodyweight_reps(message.text)
@@ -464,11 +545,12 @@ async def edit_workout_new_value(message: Message, state: FSMContext) -> None:
             await message.answer(INVALID_REPS_MSG)
             return
     elif exercise_type == EXERCISE_TIMED:
-        reps = parse_time_input(message.text)
-        if reps is None:
+        duration_seconds = parse_time_input(message.text)
+        if duration_seconds is None:
             await message.answer(INVALID_TIME_MSG)
             return
         weight = None
+        reps = None
     else:
         parsed = parse_weighted_set(message.text)
         if parsed is None:
@@ -477,11 +559,53 @@ async def edit_workout_new_value(message: Message, state: FSMContext) -> None:
         weight, reps = parsed
 
     try:
-        await db.update_set(set_id, reps=reps, weight=weight)
+        if is_new_set:
+            if not workout_exercise_id or set_number is None:
+                await message.answer("Данные подхода потеряны. Начните редактирование заново.")
+                return
+            await db.add_set(
+                workout_exercise_id=workout_exercise_id,
+                set_number=set_number,
+                weight=weight,
+                reps=reps,
+                duration_seconds=duration_seconds,
+            )
+            success_msg = "Подход успешно добавлен!"
+        else:
+            if set_id is None:
+                await message.answer("Данные подхода потеряны. Начните редактирование заново.")
+                return
+            if exercise_type == EXERCISE_TIMED:
+                await db.update_set(
+                    set_id,
+                    weight=None,
+                    reps=None,
+                    duration_seconds=duration_seconds,
+                    distance_meters=None,
+                )
+            elif exercise_type == EXERCISE_BODYWEIGHT:
+                await db.update_set(
+                    set_id,
+                    weight=None,
+                    reps=reps,
+                    duration_seconds=None,
+                    distance_meters=None,
+                )
+            else:
+                await db.update_set(
+                    set_id,
+                    weight=weight,
+                    reps=reps,
+                    duration_seconds=None,
+                    distance_meters=None,
+                )
+            success_msg = "Подход успешно изменён!"
+
         rows = await db.get_workout_detail_by_id(workout_id)
     except Exception:
         logger.exception(
-            "Ошибка обновления подхода: set_id=%s workout_id=%s",
+            "Ошибка сохранения подхода: is_new_set=%s set_id=%s workout_id=%s",
+            is_new_set,
             set_id,
             workout_id,
         )
@@ -509,6 +633,6 @@ async def edit_workout_new_value(message: Message, state: FSMContext) -> None:
         keyboard = workout_report_keyboard(workout_id)
 
     await message.answer(
-        f"Подход успешно изменён!\n\nОбновлённая статистика:\n\n{report}",
+        f"{success_msg}\n\nОбновлённая статистика:\n\n{report}",
         reply_markup=keyboard,
     )

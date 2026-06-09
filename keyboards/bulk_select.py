@@ -33,8 +33,9 @@ def bulk_select_keyboard(
         ex_id = int(exercise["id"])
         check = "✅ " if ex_id in selected else ""
         icon = _exercise_icon(exercise)
+        shared = "🌐 " if exercise.get("id_user") is None else ""
         buttons.append([InlineKeyboardButton(
-            text=f"{check}{icon} {exercise['name']}",
+            text=f"{check}{shared}{icon} {exercise['name']}",
             callback_data=f"bulk:toggle:{mode}:{context_id}:{ex_id}",
         )])
 

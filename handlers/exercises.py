@@ -88,18 +88,51 @@ async def view_exercise(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Упражнение не найдено", show_alert=True)
         return
 
+    is_admin = exercise.get("id_user") is None
+    header = f"🏋️ <b>{exercise['name']}</b>\nТип: {_type_label(exercise)}"
+    if is_admin:
+        header += "\n\n🌐 Общее упражнение (доступно всем пользователям)"
+    else:
+        header += "\n\nВыберите действие:"
+
     await callback.message.edit_text(
-        f"🏋️ <b>{exercise['name']}</b>\n"
-        f"Тип: {_type_label(exercise)}\n\n"
-        f"Выберите действие:",
+        header,
         reply_markup=exercise_manage_keyboard(exercise),
     )
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("myex:delete:"))
+async def delete_exercise(callback: CallbackQuery, state: FSMContext) -> None:
+    exercise_id = int(callback.data.split(":")[-1])
+    user = await db.get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала нажмите /start", show_alert=True)
+        return
+
+    exercise = await db.get_exercise_by_id(exercise_id)
+    if not exercise or exercise.get("id_user") != user["id"]:
+        await callback.answer("Нельзя удалить это упражнение", show_alert=True)
+        return
+
+    try:
+        await db.soft_delete_global_exercise(exercise_id, user["id"])
+    except Exception:
+        logger.exception("Ошибка удаления упражнения: exercise_id=%s", exercise_id)
+        await callback.answer("Не удалось удалить упражнение", show_alert=True)
+        return
+
+    await _show_exercises_context(callback, state, user["id"])
+    await callback.answer("Упражнение удалено из каталога")
+
+
 @router.callback_query(F.data.startswith("myex:rename:"))
 async def rename_exercise_start(callback: CallbackQuery, state: FSMContext) -> None:
     exercise_id = int(callback.data.split(":")[-1])
+    exercise = await db.get_exercise_by_id(exercise_id)
+    if not exercise or exercise.get("id_user") is None:
+        await callback.answer("Общие упражнения нельзя переименовывать", show_alert=True)
+        return
     await state.set_state(EditExerciseStates.waiting_for_new_name)
     await state.update_data(editing_exercise_id=exercise_id)
     await callback.message.edit_text("Введите <b>новое название</b> упражнения:")
@@ -114,6 +147,12 @@ async def rename_exercise_finish(message: Message, state: FSMContext) -> None:
 
     if not new_name or len(new_name) > 100:
         await message.answer("Введите название от 1 до 100 символов:")
+        return
+
+    user = await db.get_user_by_telegram_id(message.from_user.id)
+    exercise = await db.get_exercise_by_id(exercise_id)
+    if not user or not exercise or exercise.get("id_user") != user["id"]:
+        await message.answer("Нельзя переименовать это упражнение.")
         return
 
     try:
@@ -137,6 +176,10 @@ async def rename_exercise_finish(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("myex:toggle:"))
 async def toggle_exercise_type(callback: CallbackQuery, state: FSMContext) -> None:
     exercise_id = int(callback.data.split(":")[-1])
+    exercise = await db.get_exercise_by_id(exercise_id)
+    if not exercise or exercise.get("id_user") is None:
+        await callback.answer("Общие упражнения нельзя изменять", show_alert=True)
+        return
 
     try:
         await db.cycle_exercise_type(exercise_id)
