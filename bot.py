@@ -26,6 +26,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from database.connection import close_db, init_db
 from handlers.exercises import router as exercises_router
+from handlers.settings import router as settings_router
 from handlers.start import router as start_router
 from handlers.statistics import router as statistics_router
 from handlers.workout import router as workout_router
@@ -80,6 +81,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.include_router(start_router)
+    dp.include_router(settings_router)
     dp.include_router(exercises_router)
     dp.include_router(statistics_router)
     dp.include_router(workout_router)

@@ -22,6 +22,19 @@ class ExerciseStates(StatesGroup):
 
     waiting_for_name = State()
     waiting_for_type = State()
+    waiting_for_category = State()
+
+
+class CategoryStates(StatesGroup):
+    """Создание категории упражнений."""
+
+    waiting_for_name = State()
+
+
+class PresetSaveStates(StatesGroup):
+    """Сохранение завершённой тренировки как пресета."""
+
+    waiting_for_name = State()
 
 
 class EditExerciseStates(StatesGroup):

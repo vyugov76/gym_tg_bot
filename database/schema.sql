@@ -1,27 +1,53 @@
-INSERT INTO GTB_workout_exercises (workout_id, user_id, exercise_name, is_bodyweight) VALUES
--- День 1. PUSH
-(NULL, 1, N'Жим лежа на горизонтальной скамье', 0),
-(NULL, 1, N'Жим гантелей на наклонной скамье (30°)', 0),
-(NULL, 1, N'Тренажер Бабочка', 0),
-(NULL, 1, N'Махи гантелями в стороны', 0),
-(NULL, 1, N'Разгибания на трицепс в блоке', 0),
-(NULL, 1, N'Скручивания на полу / в тренажере', 1),
-(NULL, 1, N'Кардио: дорожка (быстрая ходьба в горку)', 2),
+-- ===================================================================
+-- 3. ИСПРАВЛЕНИЕ ТАБЛИЦЫ GTB_workout_exercises (Безопасный вариант)
+-- ===================================================================
+-- Создаем внешний ключ БЕЗ ON DELETE CASCADE (используем NO ACTION)
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GTB_workout_exercises_Users')
+    ALTER TABLE GTB_workout_exercises ADD CONSTRAINT FK_GTB_workout_exercises_Users 
+    FOREIGN KEY (id_user) REFERENCES GTB_users(id_user) ON DELETE NO ACTION;
 
--- День 2. PULL
-(NULL, 1, N'Подтягивания', 1),
-(NULL, 1, N'Тяга штанги в наклоне', 0),
-(NULL, 1, N'Тяга гантели к поясу в упоре', 0),
-(NULL, 1, N'Махи гантелями в наклоне', 0),
-(NULL, 1, N'Сгибания рук со штангой', 0),
-(NULL, 1, N'Кисть Смаева / Предплечья', 0),
-(NULL, 1, N'Кардио: эллипс или велотренажер', 2),
 
--- День 3. LEGS
-(NULL, 1, N'Жим ногами', 0),
-(NULL, 1, N'Болгарские приседания', 0),
-(NULL, 1, N'Разгибания ног в тренажере', 0),
-(NULL, 1, N'Сгибания ног лежа', 0),
-(NULL, 1, N'Икры в тренажере', 0),
-(NULL, 1, N'Подъем ног в висе на турнике', 1),
-(NULL, 1, N'Кардио: спокойная ходьба', 2);
+-- ===================================================================
+-- 4. ИСПРАВЛЕНИЕ ТАБЛИЦЫ GTB_preset_workouts
+-- ===================================================================
+-- Если этот блок не успел выполниться в прошлый раз из-за ошибки выше:
+DECLARE @SqlPresets NVARCHAR(MAX) = (
+    SELECT 'ALTER TABLE GTB_preset_workouts DROP CONSTRAINT ' + name
+    FROM sys.foreign_keys
+    WHERE parent_object_id = OBJECT_ID('GTB_preset_workouts') 
+      AND referenced_object_id = OBJECT_ID('GTB_users')
+);
+IF @SqlPresets IS NOT NULL EXEC sp_executesql @SqlPresets;
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_preset_workouts') AND name = 'user_id')
+    EXEC sp_rename 'GTB_preset_workouts.user_id', 'id_user', 'COLUMN';
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GTB_preset_workouts_Users')
+    ALTER TABLE GTB_preset_workouts ADD CONSTRAINT FK_GTB_preset_workouts_Users 
+    FOREIGN KEY (id_user) REFERENCES GTB_users(id_user) ON DELETE CASCADE;
+
+
+-- ===================================================================
+-- 5. ИСПРАВЛЕНИЕ ТАБЛИЦЫ GTB_preset_exercises
+-- ===================================================================
+DECLARE @SqlPresetEx NVARCHAR(MAX) = (
+    SELECT 'ALTER TABLE GTB_preset_exercises DROP CONSTRAINT ' + name
+    FROM sys.foreign_keys
+    WHERE parent_object_id = OBJECT_ID('GTB_preset_exercises') 
+      AND referenced_object_id = OBJECT_ID('GTB_preset_workouts')
+);
+IF @SqlPresetEx IS NOT NULL EXEC sp_executesql @SqlPresetEx;
+
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_preset_exercises') AND name = 'preset_id')
+    EXEC sp_rename 'GTB_preset_exercises.preset_id', 'id_preset', 'COLUMN';
+
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GTB_preset_exercises_Presets')
+    ALTER TABLE GTB_preset_exercises ADD CONSTRAINT FK_GTB_preset_exercises_Presets 
+    FOREIGN KEY (id_preset) REFERENCES GTB_preset_workouts(id_preset) ON DELETE CASCADE;
+
+
+-- ===================================================================
+-- 6. ИСПРАВЛЕНИЕ ТАБЛИЦЫ GTB_sets
+-- ===================================================================
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_sets') AND name = 'workout_exercise_id')
+    EXEC sp_rename 'GTB_sets.workout_exercise_id', 'id_workout_exercise', 'COLUMN';

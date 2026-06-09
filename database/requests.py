@@ -113,20 +113,115 @@ async def add_user(telegram_id: int, height: float, weight: float) -> int:
     return int(user_id)
 
 
-# --- Упражнения (история из GTB_workout_exercises) ---
+# --- Категории ---
 
 
-async def get_exercises_by_user_id(user_id: int) -> list[dict[str, Any]]:
+async def get_categories_by_user_id(user_id: int) -> list[dict[str, Any]]:
+    return await _run_query(
+        """
+        SELECT id_category AS id, category_name AS name
+        FROM GTB_categories
+        WHERE id_user = ?
+        ORDER BY category_name
+        """,
+        (user_id,),
+        fetch="all",
+    )
+
+
+async def get_category_by_id(category_id: int) -> dict[str, Any] | None:
+    return await _run_query(
+        """
+        SELECT id_category AS id, id_user, category_name AS name
+        FROM GTB_categories
+        WHERE id_category = ?
+        """,
+        (category_id,),
+        fetch="one",
+    )
+
+
+async def add_category(user_id: int, category_name: str) -> int:
+    category_id = await _run_query(
+        """
+        INSERT INTO GTB_categories (id_user, category_name)
+        OUTPUT INSERTED.id_category
+        VALUES (?, ?)
+        """,
+        (user_id, category_name),
+        fetch="scalar",
+    )
+    return int(category_id)
+
+
+async def delete_category(category_id: int, user_id: int) -> None:
+    """Удаляет категорию. Упражнения получают category_id = NULL (ON DELETE SET NULL)."""
+    await _run_query(
+        """
+        DELETE FROM GTB_categories
+        WHERE id_category = ? AND id_user = ?
+        """,
+        (category_id, user_id),
+    )
+
+
+# --- Глобальный каталог упражнений (workout_id IS NULL) ---
+
+
+async def get_global_exercises_by_user_id(user_id: int) -> list[dict[str, Any]]:
     rows = await _run_query(
         """
         SELECT
-            MAX(id_workout_exercise) AS id,
+            id_workout_exercise AS id,
             exercise_name AS name,
-            is_bodyweight
+            is_bodyweight,
+            category_id
         FROM GTB_workout_exercises
-        WHERE user_id = ?
-        GROUP BY exercise_name, is_bodyweight
-        ORDER BY name
+        WHERE id_user = ? AND workout_id IS NULL
+        ORDER BY exercise_name
+        """,
+        (user_id,),
+        fetch="all",
+    )
+    return [_normalize_exercise_row(row) for row in rows]
+
+
+async def get_exercises_by_category(
+    user_id: int,
+    category_id: int,
+) -> list[dict[str, Any]]:
+    rows = await _run_query(
+        """
+        SELECT
+            id_workout_exercise AS id,
+            exercise_name AS name,
+            is_bodyweight,
+            category_id
+        FROM GTB_workout_exercises
+        WHERE id_user = ?
+          AND workout_id IS NULL
+          AND category_id = ?
+        ORDER BY exercise_name
+        """,
+        (user_id, category_id),
+        fetch="all",
+    )
+    return [_normalize_exercise_row(row) for row in rows]
+
+
+async def get_unsorted_exercises(user_id: int) -> list[dict[str, Any]]:
+    rows = await _run_query(
+        """
+        SELECT
+            id_workout_exercise AS id,
+            exercise_name AS name,
+            is_bodyweight,
+            category_id
+        FROM GTB_workout_exercises
+        WHERE id_user = ?
+          AND workout_id IS NULL
+          AND category_id IS NULL
+        ORDER BY exercise_name
         """,
         (user_id,),
         fetch="all",
@@ -139,9 +234,11 @@ async def get_exercise_by_id(exercise_id: int) -> dict[str, Any] | None:
         """
         SELECT
             id_workout_exercise AS id,
-            user_id,
+            id_user,
             exercise_name AS name,
-            is_bodyweight
+            is_bodyweight,
+            category_id,
+            workout_id
         FROM GTB_workout_exercises
         WHERE id_workout_exercise = ?
         """,
@@ -151,22 +248,38 @@ async def get_exercise_by_id(exercise_id: int) -> dict[str, Any] | None:
     return _normalize_exercise_row(row) if row else None
 
 
+async def add_global_exercise(
+    user_id: int,
+    exercise_name: str,
+    exercise_type: int,
+    category_id: int | None = None,
+) -> int:
+    exercise_id = await _run_query(
+        """
+        INSERT INTO GTB_workout_exercises
+            (workout_id, id_user, exercise_name, is_bodyweight, category_id)
+        OUTPUT INSERTED.id_workout_exercise
+        VALUES (NULL, ?, ?, ?, ?)
+        """,
+        (user_id, exercise_name, exercise_type, category_id),
+        fetch="scalar",
+    )
+    return int(exercise_id)
+
+
 async def update_exercise_name(exercise_id: int, new_name: str) -> None:
-    exercise = await get_exercise_by_id(exercise_id)
-    if not exercise:
-        return
     await _run_query(
         """
         UPDATE GTB_workout_exercises
         SET exercise_name = ?
-        WHERE user_id = ? AND exercise_name = ? AND is_bodyweight = ?
+        WHERE id_workout_exercise = ? AND workout_id IS NULL
         """,
-        (new_name, exercise["user_id"], exercise["name"], int(exercise["is_bodyweight"])),
+        (new_name, exercise_id),
     )
 
 
 async def cycle_exercise_type(exercise_id: int) -> int:
-    """Переключает тип упражнения по циклу 0 → 1 → 2 → 0."""
+    """Переключает тип глобального упражнения по циклу 0 → 1 → 2 → 0."""
     exercise = await get_exercise_by_id(exercise_id)
     if not exercise:
         return 0
@@ -176,11 +289,143 @@ async def cycle_exercise_type(exercise_id: int) -> int:
         """
         UPDATE GTB_workout_exercises
         SET is_bodyweight = ?
-        WHERE user_id = ? AND exercise_name = ? AND is_bodyweight = ?
+        WHERE id_workout_exercise = ? AND workout_id IS NULL
         """,
-        (new_value, exercise["user_id"], exercise["name"], current),
+        (new_value, exercise_id),
     )
     return new_value
+
+
+# Обратная совместимость: старое имя функции
+async def get_exercises_by_user_id(user_id: int) -> list[dict[str, Any]]:
+    return await get_global_exercises_by_user_id(user_id)
+
+
+# --- Пресеты (готовые тренировки) ---
+
+
+async def get_presets_by_user_id(user_id: int) -> list[dict[str, Any]]:
+    return await _run_query(
+        """
+        SELECT id_preset AS id, preset_name AS name
+        FROM GTB_preset_workouts
+        WHERE id_user = ?
+        ORDER BY preset_name
+        """,
+        (user_id,),
+        fetch="all",
+    )
+
+
+async def get_preset_by_id(preset_id: int) -> dict[str, Any] | None:
+    return await _run_query(
+        """
+        SELECT id_preset AS id, id_user, preset_name AS name
+        FROM GTB_preset_workouts
+        WHERE id_preset = ?
+        """,
+        (preset_id,),
+        fetch="one",
+    )
+
+
+async def get_preset_exercises(preset_id: int) -> list[dict[str, Any]]:
+    rows = await _run_query(
+        """
+        SELECT
+            id_preset_exercise AS id,
+            exercise_name AS name,
+            is_bodyweight,
+            sequence_number
+        FROM GTB_preset_exercises
+        WHERE id_preset = ?
+        ORDER BY sequence_number, id_preset_exercise
+        """,
+        (preset_id,),
+        fetch="all",
+    )
+    return [_normalize_exercise_row(row) for row in rows]
+
+
+async def create_preset(user_id: int, preset_name: str) -> int:
+    preset_id = await _run_query(
+        """
+        INSERT INTO GTB_preset_workouts (id_user, preset_name)
+        OUTPUT INSERTED.id_preset
+        VALUES (?, ?)
+        """,
+        (user_id, preset_name),
+        fetch="scalar",
+    )
+    return int(preset_id)
+
+
+async def add_preset_exercise(
+    preset_id: int,
+    exercise_name: str,
+    exercise_type: int,
+    sequence_number: int,
+) -> int:
+    preset_exercise_id = await _run_query(
+        """
+        INSERT INTO GTB_preset_exercises
+            (id_preset, exercise_name, is_bodyweight, sequence_number)
+        OUTPUT INSERTED.id_preset_exercise
+        VALUES (?, ?, ?, ?)
+        """,
+        (preset_id, exercise_name, exercise_type, sequence_number),
+        fetch="scalar",
+    )
+    return int(preset_exercise_id)
+
+
+async def delete_preset(preset_id: int, user_id: int) -> None:
+    """Удаляет шаблон. Исторические GTB_workouts не затрагиваются."""
+    await _run_query(
+        """
+        DELETE FROM GTB_preset_workouts
+        WHERE id_preset = ? AND id_user = ?
+        """,
+        (preset_id, user_id),
+    )
+
+
+async def get_unique_workout_exercises_ordered(
+    workout_id: int,
+) -> list[dict[str, Any]]:
+    """Уникальные упражнения тренировки в порядке первого появления."""
+    rows = await _run_query(
+        """
+        SELECT
+            exercise_name AS name,
+            is_bodyweight,
+            MIN(id_workout_exercise) AS first_id
+        FROM GTB_workout_exercises
+        WHERE workout_id = ?
+        GROUP BY exercise_name, is_bodyweight
+        ORDER BY MIN(id_workout_exercise)
+        """,
+        (workout_id,),
+        fetch="all",
+    )
+    return [_normalize_exercise_row(row) for row in rows]
+
+
+async def create_preset_from_workout(
+    user_id: int,
+    preset_name: str,
+    workout_id: int,
+) -> int:
+    preset_id = await create_preset(user_id, preset_name)
+    exercises = await get_unique_workout_exercises_ordered(workout_id)
+    for seq, exercise in enumerate(exercises, start=1):
+        await add_preset_exercise(
+            preset_id=preset_id,
+            exercise_name=exercise["name"],
+            exercise_type=exercise["is_bodyweight"],
+            sequence_number=seq,
+        )
+    return preset_id
 
 
 # --- Тренировки ---
@@ -189,7 +434,7 @@ async def cycle_exercise_type(exercise_id: int) -> int:
 async def create_workout(user_id: int) -> int:
     workout_id = await _run_query(
         """
-        INSERT INTO GTB_workouts (user_id)
+        INSERT INTO GTB_workouts (id_user)
         OUTPUT INSERTED.id_workout
         VALUES (?)
         """,
@@ -204,15 +449,16 @@ async def add_workout_exercise(
     user_id: int,
     exercise_name: str,
     exercise_type: int,
+    category_id: int | None = None,
 ) -> int:
     workout_exercise_id = await _run_query(
         """
         INSERT INTO GTB_workout_exercises
-            (workout_id, user_id, exercise_name, is_bodyweight)
+            (workout_id, id_user, exercise_name, is_bodyweight, category_id)
         OUTPUT INSERTED.id_workout_exercise
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (workout_id, user_id, exercise_name, exercise_type),
+        (workout_id, user_id, exercise_name, exercise_type, category_id),
         fetch="scalar",
     )
     return int(workout_exercise_id)
@@ -226,7 +472,7 @@ async def add_set(
 ) -> int:
     set_id = await _run_query(
         """
-        INSERT INTO GTB_sets (workout_exercise_id, set_number, weight, reps)
+        INSERT INTO GTB_sets (id_workout_exercise, set_number, weight, reps)
         OUTPUT INSERTED.id_set
         VALUES (?, ?, ?, ?)
         """,
@@ -242,7 +488,7 @@ async def delete_last_set(workout_exercise_id: int) -> int | None:
         """
         SELECT TOP 1 set_number
         FROM GTB_sets
-        WHERE workout_exercise_id = ?
+        WHERE id_workout_exercise = ?
         ORDER BY set_number DESC, id_set DESC
         """,
         (workout_exercise_id,),
@@ -254,7 +500,7 @@ async def delete_last_set(workout_exercise_id: int) -> int | None:
     await _run_query(
         """
         DELETE FROM GTB_sets
-        WHERE workout_exercise_id = ? AND set_number = ?
+        WHERE id_workout_exercise = ? AND set_number = ?
         """,
         (workout_exercise_id, int(set_number)),
     )
@@ -278,7 +524,7 @@ async def get_user_workout_stats(user_id: int) -> dict[str, Any]:
         """
         SELECT COUNT(*) AS workout_count
         FROM GTB_workouts
-        WHERE user_id = ? AND finished_at IS NOT NULL
+        WHERE id_user = ? AND finished_at IS NOT NULL
         """,
         (user_id,),
         fetch="one",
@@ -291,7 +537,7 @@ async def get_last_workouts(user_id: int, limit: int = 5) -> list[dict[str, Any]
         """
         SELECT TOP (?) id_workout AS id, started_at, finished_at
         FROM GTB_workouts
-        WHERE user_id = ? AND finished_at IS NOT NULL
+        WHERE id_user = ? AND finished_at IS NOT NULL
         ORDER BY finished_at DESC
         """,
         (limit, user_id),
@@ -308,7 +554,7 @@ async def get_total_workouts_for_current_month(user_id: int) -> int:
         """
         SELECT COUNT(*) AS total
         FROM GTB_workouts
-        WHERE user_id = ?
+        WHERE id_user = ?
           AND finished_at IS NOT NULL
           AND YEAR(finished_at) = YEAR(GETDATE())
           AND MONTH(finished_at) = MONTH(GETDATE())
@@ -325,7 +571,7 @@ async def get_workout_days_for_month(user_id: int, year: int, month: int) -> set
         """
         SELECT DISTINCT DAY(started_at) AS workout_day
         FROM GTB_workouts
-        WHERE user_id = ?
+        WHERE id_user = ?
           AND finished_at IS NOT NULL
           AND YEAR(started_at) = ?
           AND MONTH(started_at) = ?
@@ -360,8 +606,8 @@ async def get_detailed_workouts_by_date(
         INNER JOIN GTB_workout_exercises we
             ON we.workout_id = w.id_workout
         LEFT JOIN GTB_sets s
-            ON s.workout_exercise_id = we.id_workout_exercise
-        WHERE w.user_id = ?
+            ON s.id_workout_exercise = we.id_workout_exercise
+        WHERE w.id_user = ?
           AND w.finished_at IS NOT NULL
           AND CAST(w.started_at AS DATE) = ?
         ORDER BY w.started_at, we.id_workout_exercise, s.set_number
@@ -376,7 +622,7 @@ async def get_workout_user_id(workout_id: int) -> int | None:
     """Возвращает id_user владельца тренировки или None."""
     user_id = await _run_query(
         """
-        SELECT user_id
+        SELECT id_user
         FROM GTB_workouts
         WHERE id_workout = ?
         """,
@@ -387,13 +633,13 @@ async def get_workout_user_id(workout_id: int) -> int | None:
 
 
 async def delete_workout(workout_id: int) -> None:
-    """Удаляет тренировку и все связанные подходы/упражнения."""
+    """Удаляет тренировку и все связанные подходы/упражнения сессии."""
     await _run_query(
         """
         DELETE s
         FROM GTB_sets s
         INNER JOIN GTB_workout_exercises we
-            ON we.id_workout_exercise = s.workout_exercise_id
+            ON we.id_workout_exercise = s.id_workout_exercise
         WHERE we.workout_id = ?
         """,
         (workout_id,),
@@ -423,7 +669,7 @@ async def get_set_by_number(
         """
         SELECT id_set AS id, set_number, weight, reps
         FROM GTB_sets
-        WHERE workout_exercise_id = ? AND set_number = ?
+        WHERE id_workout_exercise = ? AND set_number = ?
         """,
         (workout_exercise_id, set_number),
         fetch="one",
@@ -464,7 +710,7 @@ async def get_workout_detail_by_id(workout_id: int) -> list[dict[str, Any]]:
         INNER JOIN GTB_workout_exercises we
             ON we.workout_id = w.id_workout
         LEFT JOIN GTB_sets s
-            ON s.workout_exercise_id = we.id_workout_exercise
+            ON s.id_workout_exercise = we.id_workout_exercise
         WHERE w.id_workout = ?
           AND w.finished_at IS NOT NULL
         ORDER BY we.id_workout_exercise, s.set_number

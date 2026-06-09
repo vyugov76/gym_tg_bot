@@ -1,4 +1,4 @@
-"""Управление кастомными упражнениями в профиле."""
+"""Управление упражнениями в категориях настроек."""
 
 import logging
 
@@ -7,20 +7,17 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 import database.requests as db
-from keyboards.menu import exercise_manage_keyboard, my_exercises_keyboard
+from keyboards.menu import (
+    categories_list_keyboard,
+    category_detail_keyboard,
+    exercise_manage_keyboard,
+    my_exercises_keyboard,
+)
 from states.workout_states import EditExerciseStates
 from utils.exercise_types import EXERCISE_TYPE_LABELS, normalize_exercise_type
 
 router = Router(name="exercises")
 logger = logging.getLogger(__name__)
-
-
-def _log_callback(callback: CallbackQuery) -> None:
-    logger.info(
-        "Inline-кнопка: user_id=%s callback_data=%s",
-        callback.from_user.id,
-        callback.data,
-    )
 
 
 def _type_label(exercise: dict) -> str:
@@ -30,57 +27,35 @@ def _type_label(exercise: dict) -> str:
     return EXERCISE_TYPE_LABELS.get(exercise_type, "неизвестно")
 
 
-async def _show_exercises_list(
+async def _show_exercises_context(
     callback: CallbackQuery,
+    state: FSMContext,
     db_user_id: int,
-    telegram_id: int,
 ) -> None:
-    exercises = await db.get_exercises_by_user_id(db_user_id)
-    logger.info(
-        f"Пользователь {telegram_id} открыл список упражнений. Найдено: {len(exercises)}"
-    )
+    data = await state.get_data()
+    category_id = data.get("settings_category_id")
 
-    if exercises:
-        text = "📋 <b>Мои упражнения</b>\n\nВыберите упражнение для управления:"
-    else:
-        text = (
-            "📋 <b>Мои упражнения</b>\n\n"
-            "У вас пока нет упражнений.\n"
-            "Создайте первое во время тренировки — кнопка «Создать новое упражнение»."
+    if category_id is None:
+        exercises = await db.get_unsorted_exercises(db_user_id)
+        title = "📁 <b>Несортированные</b>"
+        extra_keyboard = categories_list_keyboard(
+            await db.get_categories_by_user_id(db_user_id)
         )
+    else:
+        category_name = data.get("settings_category_name", "Категория")
+        exercises = await db.get_exercises_by_category(db_user_id, category_id)
+        title = f"📂 <b>{category_name}</b>"
+        extra_keyboard = category_detail_keyboard(category_id)
 
     await callback.message.edit_text(
-        text,
+        f"{title}\n\nУпражнения ({len(exercises)}):",
         reply_markup=my_exercises_keyboard(exercises),
     )
-
-
-@router.message(F.text == "Мои упражнения")
-async def show_my_exercises(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    user_id = message.from_user.id
-    user = await db.get_user_by_telegram_id(user_id)
-
-    if not user:
-        logger.warning("Незарегистрированный user_id=%s запросил «Мои упражнения»", user_id)
-        await message.answer("Сначала нажмите /start для регистрации.")
-        return
-
-    exercises = await db.get_exercises_by_user_id(user["id"])
-    logger.info(
-        f"Пользователь {user_id} открыл список упражнений. Найдено: {len(exercises)}"
-    )
-
-    if exercises:
-        text = "📋 <b>Мои упражнения</b>\n\nВыберите упражнение для управления:"
-    else:
-        text = (
-            "📋 <b>Мои упражнения</b>\n\n"
-            "У вас пока нет упражнений.\n"
-            "Создайте первое во время тренировки — кнопка «Создать новое упражнение»."
+    if category_id is not None:
+        await callback.message.answer(
+            "Действия с категорией:",
+            reply_markup=extra_keyboard,
         )
-
-    await message.answer(text, reply_markup=my_exercises_keyboard(exercises))
 
 
 @router.callback_query(F.data == "myex:noop")
@@ -88,35 +63,28 @@ async def noop_callback(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "myex:back")
-async def back_to_exercises_list(callback: CallbackQuery, state: FSMContext) -> None:
-    _log_callback(callback)
-    await state.clear()
+@router.callback_query(F.data == "myex:back_ctx")
+async def back_to_exercises_context(callback: CallbackQuery, state: FSMContext) -> None:
     user = await db.get_user_by_telegram_id(callback.from_user.id)
     if not user:
         await callback.answer("Сначала нажмите /start", show_alert=True)
         return
-    await _show_exercises_list(callback, user["id"], callback.from_user.id)
+    await _show_exercises_context(callback, state, user["id"])
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("myex:view:"))
 async def view_exercise(callback: CallbackQuery, state: FSMContext) -> None:
-    _log_callback(callback)
     exercise_id = int(callback.data.split(":")[-1])
 
     try:
         exercise = await db.get_exercise_by_id(exercise_id)
     except Exception:
-        logger.exception(
-            "Ошибка загрузки упражнения: user_id=%s exercise_id=%s",
-            callback.from_user.id,
-            exercise_id,
-        )
+        logger.exception("Ошибка загрузки упражнения: exercise_id=%s", exercise_id)
         await callback.answer("Ошибка загрузки упражнения", show_alert=True)
         return
 
-    if not exercise:
+    if not exercise or exercise.get("workout_id") is not None:
         await callback.answer("Упражнение не найдено", show_alert=True)
         return
 
@@ -131,34 +99,20 @@ async def view_exercise(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("myex:rename:"))
 async def rename_exercise_start(callback: CallbackQuery, state: FSMContext) -> None:
-    _log_callback(callback)
     exercise_id = int(callback.data.split(":")[-1])
     await state.set_state(EditExerciseStates.waiting_for_new_name)
     await state.update_data(editing_exercise_id=exercise_id)
-    logger.info(
-        "FSM user_id=%s: переименование упражнения exercise_id=%s",
-        callback.from_user.id,
-        exercise_id,
-    )
-    await callback.message.edit_text(
-        "Введите <b>новое название</b> упражнения:"
-    )
+    await callback.message.edit_text("Введите <b>новое название</b> упражнения:")
     await callback.answer()
 
 
 @router.message(EditExerciseStates.waiting_for_new_name)
 async def rename_exercise_finish(message: Message, state: FSMContext) -> None:
-    user_id = message.from_user.id
     new_name = (message.text or "").strip()
     data = await state.get_data()
     exercise_id = data.get("editing_exercise_id")
 
     if not new_name or len(new_name) > 100:
-        logger.warning(
-            "Некорректное новое название: user_id=%s text=%r",
-            user_id,
-            message.text,
-        )
         await message.answer("Введите название от 1 до 100 символов:")
         return
 
@@ -166,19 +120,11 @@ async def rename_exercise_finish(message: Message, state: FSMContext) -> None:
         await db.update_exercise_name(exercise_id, new_name)
         exercise = await db.get_exercise_by_id(exercise_id)
     except Exception:
-        logger.exception(
-            "Не удалось переименовать упражнение: user_id=%s exercise_id=%s",
-            user_id,
-            exercise_id,
-        )
+        logger.exception("Не удалось переименовать упражнение: exercise_id=%s", exercise_id)
         await message.answer("Не удалось обновить название. Попробуйте позже.")
         return
 
-    await state.clear()
-    logger.info(
-        f"Пользователь {user_id} изменил название упражнения {exercise_id} на '{new_name}'"
-    )
-
+    await state.set_state(None)
     await message.answer(
         f"✅ Название обновлено!\n\n"
         f"🏋️ <b>{exercise['name']}</b>\n"
@@ -190,26 +136,15 @@ async def rename_exercise_finish(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("myex:toggle:"))
 async def toggle_exercise_type(callback: CallbackQuery, state: FSMContext) -> None:
-    _log_callback(callback)
-    user_id = callback.from_user.id
     exercise_id = int(callback.data.split(":")[-1])
 
     try:
-        new_type = await db.cycle_exercise_type(exercise_id)
+        await db.cycle_exercise_type(exercise_id)
         exercise = await db.get_exercise_by_id(exercise_id)
     except Exception:
-        logger.exception(
-            "Не удалось переключить тип упражнения: user_id=%s exercise_id=%s",
-            user_id,
-            exercise_id,
-        )
+        logger.exception("Не удалось переключить тип: exercise_id=%s", exercise_id)
         await callback.answer("Ошибка обновления типа", show_alert=True)
         return
-
-    logger.info(
-        f"Пользователь {user_id} переключил тип упражнения {exercise_id}: "
-        f"новое значение exercise_type={new_type}"
-    )
 
     await callback.message.edit_text(
         f"🏋️ <b>{exercise['name']}</b>\n"

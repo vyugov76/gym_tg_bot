@@ -86,7 +86,7 @@ def _calendar_open_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-@router.message(F.text == "Статистика")
+@router.message(F.text == "📊 Статистика")
 async def show_statistics(message: Message) -> None:
     """Главное меню статистики."""
     telegram_id = message.from_user.id
