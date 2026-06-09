@@ -267,9 +267,9 @@ def exercise_type_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def after_set_keyboard(*, preset_mode: bool = False) -> InlineKeyboardMarkup:
-    """Действия после записи подхода."""
-    next_ex_text = "➡️ Следующее упражнение" if preset_mode else "🔄 Другое упражнение"
+def after_set_keyboard(*, show_preset_next: bool = False) -> InlineKeyboardMarkup:
+    """Действия после записи подхода (единая клавиатура для всех режимов)."""
+    next_ex_text = "➡️ Следующее упражнение" if show_preset_next else "🔄 Другое упражнение"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
@@ -292,7 +292,7 @@ def preset_program_complete_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(
                 text="🔄 Другое упражнение",
-                callback_data="set:free_mode",
+                callback_data="set:next_ex",
             )],
             [InlineKeyboardButton(
                 text="✅ Завершить тренировку",

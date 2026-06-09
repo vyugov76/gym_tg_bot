@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import date
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
 
 import pyodbc
 
@@ -18,6 +19,10 @@ MAX_QUERY_ATTEMPTS = 3
 RETRY_DELAY_SEC = 0.5
 
 _CONNECTION_ERROR_CODES = frozenset({"08S01", "HYT00", "HYT01", "01000"})
+
+# In-memory cache: admin catalog (id_user IS NULL) changes rarely.
+_admin_exercises_cache: list[dict[str, Any]] | None = None
+_user_exercises_cache: dict[int, list[dict[str, Any]]] = {}
 
 
 async def _fetch_one_dict(cur) -> dict[str, Any] | None:
@@ -80,18 +85,14 @@ async def _read_fetch_result(cur, fetch: FetchMode) -> Any:
     return None
 
 
-async def _execute_query(
-    sql: str,
-    params: tuple,
-    fetch: FetchMode,
-) -> Any:
-    """Одна попытка: acquire → execute → release (или discard при обрыве)."""
+@asynccontextmanager
+async def _pooled_connection() -> AsyncIterator[Any]:
+    """Асинхронный контекст: соединение из пула с release или discard при обрыве."""
     pool = get_pool()
     conn = await pool.acquire()
+    discard = False
     try:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, params)
-            return await _read_fetch_result(cur, fetch)
+        yield conn
     except Exception as exc:
         if _is_dead_connection_error(exc):
             logger.warning(
@@ -99,11 +100,23 @@ async def _execute_query(
                 exc,
             )
             await discard_connection(conn)
-            conn = None
+            discard = True
         raise
     finally:
-        if conn is not None:
+        if not discard:
             await pool.release(conn)
+
+
+async def _execute_query(
+    sql: str,
+    params: tuple,
+    fetch: FetchMode,
+) -> Any:
+    """Одна попытка: acquire → execute → release (или discard при обрыве)."""
+    async with _pooled_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+            return await _read_fetch_result(cur, fetch)
 
 
 async def _run_query(
@@ -166,13 +179,6 @@ def _normalize_exercise_row(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
-# Фильтр каталога: свои + админские, без удалённых
-_CATALOG_WHERE = """
-    (id_user = ? OR id_user IS NULL)
-    AND workout_id IS NULL
-    AND is_deleted = 0
-"""
-
 _SET_DETAIL_COLUMNS = """
     s.set_number,
     s.weight,
@@ -180,6 +186,112 @@ _SET_DETAIL_COLUMNS = """
     s.duration_seconds,
     s.distance_meters
 """
+
+_WORKOUT_DETAIL_SELECT = f"""
+    SELECT
+        w.id_workout,
+        w.started_at,
+        w.finished_at,
+        w.id_preset,
+        pw.preset_name,
+        we.id_workout_exercise,
+        we.exercise_name,
+        we.is_bodyweight,
+        {_SET_DETAIL_COLUMNS}
+    FROM GTB_workouts w
+    LEFT JOIN GTB_preset_workouts pw
+        ON pw.id_preset = w.id_preset
+    INNER JOIN GTB_workout_exercises we
+        ON we.workout_id = w.id_workout
+    LEFT JOIN GTB_sets s
+        ON s.id_workout_exercise = we.id_workout_exercise
+"""
+
+_CATALOG_SELECT = """
+    SELECT
+        id_workout_exercise AS id,
+        exercise_name AS name,
+        is_bodyweight,
+        category_id,
+        id_user
+    FROM GTB_workout_exercises
+"""
+
+
+def clear_exercise_cache(user_id: int | None = None) -> None:
+    """Сбрасывает кэш каталога упражнений (всех или для одного пользователя)."""
+    global _admin_exercises_cache
+    if user_id is None:
+        _admin_exercises_cache = None
+        _user_exercises_cache.clear()
+        return
+    _user_exercises_cache.pop(user_id, None)
+
+
+def _invalidate_exercise_cache(user_id: int | None = None) -> None:
+    clear_exercise_cache(user_id)
+
+
+async def _fetch_admin_exercises(*, refresh: bool = False) -> list[dict[str, Any]]:
+    """Админский каталог (id_user IS NULL), с in-memory кэшем."""
+    global _admin_exercises_cache
+    if not refresh and _admin_exercises_cache is not None:
+        return _admin_exercises_cache
+
+    rows = await _run_query(
+        f"""
+        {_CATALOG_SELECT}
+        WHERE id_user IS NULL
+          AND workout_id IS NULL
+          AND is_deleted = 0
+        ORDER BY exercise_name
+        """,
+        fetch="all",
+    )
+    _admin_exercises_cache = [_normalize_exercise_row(row) for row in rows]
+    return _admin_exercises_cache
+
+
+async def _fetch_user_catalog_exercises(
+    user_id: int,
+    *,
+    refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """Личные упражнения пользователя в каталоге, с кэшем на user_id."""
+    if not refresh and user_id in _user_exercises_cache:
+        return _user_exercises_cache[user_id]
+
+    rows = await _run_query(
+        f"""
+        {_CATALOG_SELECT}
+        WHERE id_user = ?
+          AND workout_id IS NULL
+          AND is_deleted = 0
+        ORDER BY exercise_name
+        """,
+        (user_id,),
+        fetch="all",
+    )
+    normalized = [_normalize_exercise_row(row) for row in rows]
+    _user_exercises_cache[user_id] = normalized
+    return normalized
+
+
+async def _fetch_workout_detail_rows(
+    where_clause: str,
+    params: tuple,
+    order_by: str,
+) -> list[dict[str, Any]]:
+    rows = await _run_query(
+        f"""
+        {_WORKOUT_DETAIL_SELECT}
+        WHERE {where_clause}
+        ORDER BY {order_by}
+        """,
+        params,
+        fetch="all",
+    )
+    return _normalize_workout_detail_rows(rows)
 
 
 # --- Пользователи ---
@@ -294,6 +406,7 @@ async def bulk_assign_exercises_to_category(
         """,
         (category_id, *exercise_ids, id_user),
     )
+    _invalidate_exercise_cache(id_user)
     return len(exercise_ids)
 
 
@@ -318,6 +431,7 @@ async def bulk_unassign_exercises_from_category(
         """,
         (*exercise_ids, id_user, category_id),
     )
+    _invalidate_exercise_cache(id_user)
     return len(exercise_ids)
 
 
@@ -335,68 +449,39 @@ async def delete_category(category_id: int, user_id: int) -> None:
 # --- Глобальный каталог упражнений (workout_id IS NULL) ---
 
 
-async def get_global_exercises_by_user_id(user_id: int) -> list[dict[str, Any]]:
-    rows = await _run_query(
-        f"""
-        SELECT
-            id_workout_exercise AS id,
-            exercise_name AS name,
-            is_bodyweight,
-            category_id,
-            id_user
-        FROM GTB_workout_exercises
-        WHERE {_CATALOG_WHERE}
-        ORDER BY exercise_name
-        """,
-        (user_id,),
-        fetch="all",
-    )
-    return [_normalize_exercise_row(row) for row in rows]
+async def get_global_exercises_by_user_id(
+    user_id: int,
+    *,
+    refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    Полный каталог: админские (кэш) + личные упражнения пользователя (кэш на user_id).
+    Параметр refresh=True принудительно перечитывает данные из БД.
+    """
+    admin = await _fetch_admin_exercises(refresh=refresh)
+    user_rows = await _fetch_user_catalog_exercises(user_id, refresh=refresh)
+    merged = [*admin, *user_rows]
+    merged.sort(key=lambda row: row["name"].casefold())
+    return merged
 
 
 async def get_exercises_by_category(
     user_id: int,
     category_id: int,
+    *,
+    refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    rows = await _run_query(
-        """
-        SELECT
-            id_workout_exercise AS id,
-            exercise_name AS name,
-            is_bodyweight,
-            category_id,
-            id_user
-        FROM GTB_workout_exercises
-        WHERE (id_user = ? OR id_user IS NULL)
-          AND workout_id IS NULL
-          AND is_deleted = 0
-          AND category_id = ?
-        ORDER BY exercise_name
-        """,
-        (user_id, category_id),
-        fetch="all",
-    )
-    return [_normalize_exercise_row(row) for row in rows]
+    catalog = await get_global_exercises_by_user_id(user_id, refresh=refresh)
+    return [row for row in catalog if row.get("category_id") == category_id]
 
 
-async def get_unsorted_exercises(user_id: int) -> list[dict[str, Any]]:
-    rows = await _run_query(
-        f"""
-        SELECT
-            id_workout_exercise AS id,
-            exercise_name AS name,
-            is_bodyweight,
-            category_id,
-            id_user
-        FROM GTB_workout_exercises
-        WHERE {_CATALOG_WHERE}
-          AND category_id IS NULL
-        ORDER BY exercise_name
-        """,
-        (user_id,),
-        fetch="all",
-    )
-    return [_normalize_exercise_row(row) for row in rows]
+async def get_unsorted_exercises(
+    user_id: int,
+    *,
+    refresh: bool = False,
+) -> list[dict[str, Any]]:
+    catalog = await get_global_exercises_by_user_id(user_id, refresh=refresh)
+    return [row for row in catalog if row.get("category_id") is None]
 
 
 async def get_exercise_by_id(exercise_id: int) -> dict[str, Any] | None:
@@ -436,10 +521,12 @@ async def add_global_exercise(
         (user_id, exercise_name, exercise_type, category_id),
         fetch="scalar",
     )
+    _invalidate_exercise_cache(user_id)
     return int(exercise_id)
 
 
 async def update_exercise_name(exercise_id: int, new_name: str) -> None:
+    exercise = await get_exercise_by_id(exercise_id)
     await _run_query(
         """
         UPDATE GTB_workout_exercises
@@ -449,6 +536,8 @@ async def update_exercise_name(exercise_id: int, new_name: str) -> None:
         """,
         (new_name, exercise_id),
     )
+    if exercise and exercise.get("id_user") is not None:
+        _invalidate_exercise_cache(int(exercise["id_user"]))
 
 
 async def soft_delete_global_exercise(exercise_id: int, id_user: int) -> bool:
@@ -464,6 +553,7 @@ async def soft_delete_global_exercise(exercise_id: int, id_user: int) -> bool:
         """,
         (exercise_id, id_user),
     )
+    _invalidate_exercise_cache(id_user)
     return True
 
 
@@ -483,6 +573,8 @@ async def cycle_exercise_type(exercise_id: int) -> int:
         """,
         (new_value, exercise_id),
     )
+    if exercise.get("id_user") is not None:
+        _invalidate_exercise_cache(int(exercise["id_user"]))
     return new_value
 
 
@@ -822,17 +914,71 @@ async def finish_workout(workout_id: int) -> None:
     )
 
 
-async def get_user_workout_stats(user_id: int) -> dict[str, Any]:
+async def get_workout_statistics(user_id: int) -> dict[str, Any]:
+    """
+    Агрегированная статистика тренировок за один запрос к БД:
+    количество сессий (всего / неделя / месяц / год) и суммарный тоннаж.
+    """
     row = await _run_query(
         """
-        SELECT COUNT(*) AS workout_count
-        FROM GTB_workouts
-        WHERE id_user = ? AND finished_at IS NOT NULL
+        SELECT
+            COUNT(*) AS workout_count_all_time,
+            SUM(CASE
+                WHEN YEAR(w.finished_at) = YEAR(GETDATE())
+                 AND DATEPART(ISO_WEEK, w.finished_at) = DATEPART(ISO_WEEK, GETDATE())
+                THEN 1 ELSE 0
+            END) AS workout_count_week,
+            SUM(CASE
+                WHEN YEAR(w.finished_at) = YEAR(GETDATE())
+                 AND MONTH(w.finished_at) = MONTH(GETDATE())
+                THEN 1 ELSE 0
+            END) AS workout_count_month,
+            SUM(CASE
+                WHEN YEAR(w.finished_at) = YEAR(GETDATE())
+                THEN 1 ELSE 0
+            END) AS workout_count_year,
+            (
+                SELECT ISNULL(SUM(s.weight * s.reps), 0)
+                FROM GTB_sets s
+                INNER JOIN GTB_workout_exercises we
+                    ON we.id_workout_exercise = s.id_workout_exercise
+                INNER JOIN GTB_workouts w2
+                    ON w2.id_workout = we.workout_id
+                WHERE w2.id_user = ?
+                  AND w2.finished_at IS NOT NULL
+                  AND s.weight IS NOT NULL
+                  AND s.reps IS NOT NULL
+            ) AS total_weight_lifted_all_time
+        FROM GTB_workouts w
+        WHERE w.id_user = ?
+          AND w.finished_at IS NOT NULL
         """,
-        (user_id,),
+        (user_id, user_id),
         fetch="one",
     )
-    return {"workout_count": int(row["workout_count"])}
+    if not row:
+        return {
+            "workout_count": 0,
+            "workout_count_all_time": 0,
+            "workout_count_week": 0,
+            "workout_count_month": 0,
+            "workout_count_year": 0,
+            "total_weight_lifted_all_time": 0.0,
+        }
+    return {
+        "workout_count": int(row["workout_count_all_time"]),
+        "workout_count_all_time": int(row["workout_count_all_time"]),
+        "workout_count_week": int(row["workout_count_week"] or 0),
+        "workout_count_month": int(row["workout_count_month"] or 0),
+        "workout_count_year": int(row["workout_count_year"] or 0),
+        "total_weight_lifted_all_time": float(row["total_weight_lifted_all_time"] or 0),
+    }
+
+
+async def get_user_workout_stats(user_id: int) -> dict[str, Any]:
+    """Обратная совместимость: только общее число завершённых тренировок."""
+    stats = await get_workout_statistics(user_id)
+    return {"workout_count": stats["workout_count"]}
 
 
 async def get_last_workouts(user_id: int, limit: int = 5) -> list[dict[str, Any]]:
@@ -853,19 +999,8 @@ async def get_last_workouts(user_id: int, limit: int = 5) -> list[dict[str, Any]
 
 async def get_total_workouts_for_current_month(user_id: int) -> int:
     """Количество завершённых тренировок за текущий календарный месяц."""
-    count = await _run_query(
-        """
-        SELECT COUNT(*) AS total
-        FROM GTB_workouts
-        WHERE id_user = ?
-          AND finished_at IS NOT NULL
-          AND YEAR(finished_at) = YEAR(GETDATE())
-          AND MONTH(finished_at) = MONTH(GETDATE())
-        """,
-        (user_id,),
-        fetch="scalar",
-    )
-    return int(count or 0)
+    stats = await get_workout_statistics(user_id)
+    return int(stats["workout_count_month"])
 
 
 async def get_workout_days_for_month(user_id: int, year: int, month: int) -> set[int]:
@@ -893,34 +1028,11 @@ async def get_detailed_workouts_by_date(
     JOIN GTB_workouts, GTB_workout_exercises и GTB_sets за выбранную дату.
     Фильтр по CAST(w.started_at AS DATE). user_id — внутренний id_user.
     """
-    rows = await _run_query(
-        f"""
-        SELECT
-            w.id_workout,
-            w.started_at,
-            w.finished_at,
-            w.id_preset,
-            pw.preset_name,
-            we.id_workout_exercise,
-            we.exercise_name,
-            we.is_bodyweight,
-            {_SET_DETAIL_COLUMNS}
-        FROM GTB_workouts w
-        LEFT JOIN GTB_preset_workouts pw
-            ON pw.id_preset = w.id_preset
-        INNER JOIN GTB_workout_exercises we
-            ON we.workout_id = w.id_workout
-        LEFT JOIN GTB_sets s
-            ON s.id_workout_exercise = we.id_workout_exercise
-        WHERE w.id_user = ?
-          AND w.finished_at IS NOT NULL
-          AND CAST(w.started_at AS DATE) = ?
-        ORDER BY w.started_at, we.id_workout_exercise, s.set_number
-        """,
+    return await _fetch_workout_detail_rows(
+        "w.id_user = ? AND w.finished_at IS NOT NULL AND CAST(w.started_at AS DATE) = ?",
         (user_id, selected_date),
-        fetch="all",
+        "w.started_at, we.id_workout_exercise, s.set_number",
     )
-    return _normalize_workout_detail_rows(rows)
 
 
 async def get_workout_user_id(workout_id: int) -> int | None:
@@ -1016,33 +1128,11 @@ async def update_set(
 
 async def get_workout_detail_by_id(workout_id: int) -> list[dict[str, Any]]:
     """Детальная информация о конкретной завершённой тренировке."""
-    rows = await _run_query(
-        f"""
-        SELECT
-            w.id_workout,
-            w.started_at,
-            w.finished_at,
-            w.id_preset,
-            pw.preset_name,
-            we.id_workout_exercise,
-            we.exercise_name,
-            we.is_bodyweight,
-            {_SET_DETAIL_COLUMNS}
-        FROM GTB_workouts w
-        LEFT JOIN GTB_preset_workouts pw
-            ON pw.id_preset = w.id_preset
-        INNER JOIN GTB_workout_exercises we
-            ON we.workout_id = w.id_workout
-        LEFT JOIN GTB_sets s
-            ON s.id_workout_exercise = we.id_workout_exercise
-        WHERE w.id_workout = ?
-          AND w.finished_at IS NOT NULL
-        ORDER BY we.id_workout_exercise, s.set_number
-        """,
+    return await _fetch_workout_detail_rows(
+        "w.id_workout = ? AND w.finished_at IS NOT NULL",
         (workout_id,),
-        fetch="all",
+        "we.id_workout_exercise, s.set_number",
     )
-    return _normalize_workout_detail_rows(rows)
 
 
 def _normalize_workout_detail_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

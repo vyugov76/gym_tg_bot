@@ -14,7 +14,7 @@ class WorkoutStates(StatesGroup):
     """Процесс записи тренировки."""
 
     choosing_exercise = State()
-    entering_set = State()
+    waiting_for_set_value = State()
     waiting_for_template_name = State()
 
 

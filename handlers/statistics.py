@@ -63,23 +63,27 @@ async def _verify_workout_access(
     return user, None
 
 
+def _has_back_calendar_button(
+    reply_markup: InlineKeyboardMarkup | None,
+) -> bool:
+    """Отчёт открыт из календаря — в разметке есть «Назад в календарь»."""
+    if not reply_markup or not reply_markup.inline_keyboard:
+        return False
+    for row in reply_markup.inline_keyboard:
+        for button in row:
+            if (button.callback_data or "").startswith("stats:back_calendar:"):
+                return True
+    return False
+
+
 def _detect_report_style(
-    message_text: str | None,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> str:
     """
-    Определяет источник отчёта для восстановления клавиатуры после редактирования.
-    Календарь: кнопка «Назад в календарь» или legacy-заголовок с 📆.
-    Отчёт после завершения тоже начинается с «📅 Тренировка на», но без этой кнопки.
+    Источник отчёта для восстановления UI после редактирования.
+    Только структура инлайн-кнопок: stats:back_calendar → календарь, иначе — финал.
     """
-    if reply_markup and reply_markup.inline_keyboard:
-        for row in reply_markup.inline_keyboard:
-            for button in row:
-                if (button.callback_data or "").startswith("stats:back_calendar:"):
-                    return "calendar"
-    if message_text and message_text.startswith("📆"):
-        return "calendar"
-    return "finish"
+    return "calendar" if _has_back_calendar_button(reply_markup) else "finish"
 
 
 def _format_workout_report(
@@ -368,12 +372,9 @@ async def start_edit_workout(callback: CallbackQuery, state: FSMContext) -> None
         )
         return
 
-    report_style = _detect_report_style(
-        callback.message.text,
-        callback.message.reply_markup,
-    )
+    report_style = _detect_report_style(callback.message.reply_markup)
     calendar_date = None
-    if rows:
+    if report_style == "calendar" and rows:
         calendar_date = to_local_datetime(rows[0]["started_at"]).date()
 
     await state.update_data(

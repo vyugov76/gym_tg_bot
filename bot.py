@@ -90,7 +90,7 @@ async def main() -> None:
         await init_db()
         logger.info("Подключение к БД установлено")
         logger.info("Бот запущен")
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, drop_pending_updates=True)
     except Exception:
         logger.critical("Критическая ошибка при работе бота", exc_info=True)
         raise
