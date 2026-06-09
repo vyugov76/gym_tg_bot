@@ -6,11 +6,16 @@ import logging
 from datetime import date
 from typing import Any, Literal
 
-from database.connection import get_pool
+import pyodbc
+
+from database.connection import get_pool, refresh_db_pool
 
 logger = logging.getLogger(__name__)
 
 FetchMode = Literal["one", "all", "scalar", "none"]
+MAX_QUERY_ATTEMPTS = 2
+
+_RETRYABLE_DB_ERRORS = (pyodbc.OperationalError, pyodbc.InterfaceError)
 
 
 async def _fetch_one_dict(cur) -> dict[str, Any] | None:
@@ -27,29 +32,77 @@ async def _fetch_all_dicts(cur) -> list[dict[str, Any]]:
     return [dict(zip(columns, row, strict=False)) for row in rows]
 
 
+def _is_retryable_db_error(exc: BaseException) -> bool:
+    """Проверяет, связана ли ошибка с обрывом соединения."""
+    if isinstance(exc, _RETRYABLE_DB_ERRORS):
+        return True
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10054:
+        return True
+    cause = exc.__cause__
+    if cause is not None:
+        return _is_retryable_db_error(cause)
+    return False
+
+
+async def _execute_query(
+    sql: str,
+    params: tuple,
+    fetch: FetchMode,
+) -> Any:
+    """Одна попытка выполнения запроса через текущий пул."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+            if fetch == "one":
+                return await _fetch_one_dict(cur)
+            if fetch == "all":
+                return await _fetch_all_dicts(cur)
+            if fetch == "scalar":
+                row = await cur.fetchone()
+                return row[0] if row else None
+    return None
+
+
 async def _run_query(
     sql: str,
     params: tuple = (),
     fetch: FetchMode = "none",
 ) -> Any:
-    """Выполняет SQL-запрос с логированием и обработкой ошибок."""
-    try:
-        logger.info(f"Выполнение SQL: {sql.strip()} с параметрами: {params}")
-        pool = get_pool()
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(sql, params)
-                if fetch == "one":
-                    return await _fetch_one_dict(cur)
-                if fetch == "all":
-                    return await _fetch_all_dicts(cur)
-                if fetch == "scalar":
-                    row = await cur.fetchone()
-                    return row[0] if row else None
-        return None
-    except Exception:
-        logger.exception("Ошибка при работе с БД")
-        raise
+    """Выполняет SQL-запрос; при обрыве соединения пересоздаёт пул и повторяет."""
+    last_error: BaseException | None = None
+
+    for attempt in range(1, MAX_QUERY_ATTEMPTS + 1):
+        try:
+            logger.info(
+                "Выполнение SQL (попытка %s/%s): %s с параметрами: %s",
+                attempt,
+                MAX_QUERY_ATTEMPTS,
+                sql.strip(),
+                params,
+            )
+            return await _execute_query(sql, params, fetch)
+        except Exception as exc:
+            if _is_retryable_db_error(exc) and attempt < MAX_QUERY_ATTEMPTS:
+                logger.warning(
+                    "Соединение с БД потеряно (попытка %s/%s): %s. "
+                    "Пересоздаём пул и повторяем запрос...",
+                    attempt,
+                    MAX_QUERY_ATTEMPTS,
+                    exc,
+                )
+                last_error = exc
+                await refresh_db_pool()
+                continue
+
+            logger.exception("Ошибка при работе с БД")
+            raise
+
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 def _as_exercise_type(value: Any) -> int:
