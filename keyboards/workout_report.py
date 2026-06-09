@@ -29,6 +29,21 @@ def workout_report_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def calendar_workout_report_keyboard(
+    workout_id: int,
+    year: int,
+    month: int,
+) -> InlineKeyboardMarkup:
+    """Отчёт тренировки из календаря с кнопкой возврата."""
+    base = workout_report_keyboard(workout_id)
+    rows = list(base.inline_keyboard)
+    rows.append([InlineKeyboardButton(
+        text="⬅️ Назад в календарь",
+        callback_data=f"stats:back_calendar:{year}:{month}",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def delete_confirm_keyboard(workout_id: int) -> InlineKeyboardMarkup:
     """Подтверждение удаления тренировки."""
     return InlineKeyboardMarkup(

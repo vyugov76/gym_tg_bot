@@ -1,53 +1,50 @@
 -- ===================================================================
--- 3. ИСПРАВЛЕНИЕ ТАБЛИЦЫ GTB_workout_exercises (Безопасный вариант)
+-- 1. МОДЕРНИЗАЦИЯ ТАБЛИЦЫ ПОДХОДОВ (GTB_sets)
+-- Добавляем универсальные поля для учета времени и дистанции
 -- ===================================================================
--- Создаем внешний ключ БЕЗ ON DELETE CASCADE (используем NO ACTION)
-IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GTB_workout_exercises_Users')
-    ALTER TABLE GTB_workout_exercises ADD CONSTRAINT FK_GTB_workout_exercises_Users 
-    FOREIGN KEY (id_user) REFERENCES GTB_users(id_user) ON DELETE NO ACTION;
+IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_sets') AND name = 'duration_seconds')
+    ALTER TABLE GTB_sets ADD duration_seconds INT NULL;
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_sets') AND name = 'distance_meters')
+    ALTER TABLE GTB_sets ADD distance_meters INT NULL;
+
+-- Поля weight и reps делаем необязательными (NULL), чтобы для планки можно было заполнять только время
+ALTER TABLE GTB_sets ALTER COLUMN weight DECIMAL(5,2) NULL;
+ALTER TABLE GTB_sets ALTER COLUMN reps INT NULL;
 
 
 -- ===================================================================
--- 4. ИСПРАВЛЕНИЕ ТАБЛИЦЫ GTB_preset_workouts
+-- 2. ВНЕДРЕНИЕ МЯГКОГО УДАЛЕНИЯ (Soft Delete)
+-- Добавляем флаг избыточности, чтобы данные не удалялись физически
 -- ===================================================================
--- Если этот блок не успел выполниться в прошлый раз из-за ошибки выше:
-DECLARE @SqlPresets NVARCHAR(MAX) = (
-    SELECT 'ALTER TABLE GTB_preset_workouts DROP CONSTRAINT ' + name
+IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_workout_exercises') AND name = 'is_deleted')
+    ALTER TABLE GTB_workout_exercises ADD is_deleted TINYINT NOT NULL DEFAULT 0;
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_preset_workouts') AND name = 'is_deleted')
+    ALTER TABLE GTB_preset_workouts ADD is_deleted TINYINT NOT NULL DEFAULT 0;
+
+
+-- ===================================================================
+-- 3. БЕЗОПАСНОСТЬ ИСТОРИИ ТРЕНИРОВОК
+-- Перестраиваем связь GTB_sets -> GTB_workout_exercises.
+-- Если пользователь уберет упражнение из каталога, его старые подходы в истории ДОЛЖНЫ ОСТАТЬСЯ!
+-- ===================================================================
+DECLARE @SqlSetsFK NVARCHAR(MAX) = (
+    SELECT 'ALTER TABLE GTB_sets DROP CONSTRAINT ' + name
     FROM sys.foreign_keys
-    WHERE parent_object_id = OBJECT_ID('GTB_preset_workouts') 
-      AND referenced_object_id = OBJECT_ID('GTB_users')
+    WHERE parent_object_id = OBJECT_ID('GTB_sets') 
+      AND referenced_object_id = OBJECT_ID('GTB_workout_exercises')
 );
-IF @SqlPresets IS NOT NULL EXEC sp_executesql @SqlPresets;
+IF @SqlSetsFK IS NOT NULL EXEC sp_executesql @SqlSetsFK;
 
-IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_preset_workouts') AND name = 'user_id')
-    EXEC sp_rename 'GTB_preset_workouts.user_id', 'id_user', 'COLUMN';
-
-IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GTB_preset_workouts_Users')
-    ALTER TABLE GTB_preset_workouts ADD CONSTRAINT FK_GTB_preset_workouts_Users 
-    FOREIGN KEY (id_user) REFERENCES GTB_users(id_user) ON DELETE CASCADE;
+-- Пересоздаем внешний ключ с ON DELETE NO ACTION вместо CASCADE
+ALTER TABLE GTB_sets ADD CONSTRAINT FK_GTB_sets_WorkoutExercises 
+FOREIGN KEY (id_workout_exercise) REFERENCES GTB_workout_exercises(id_workout_exercise) ON DELETE NO ACTION;
 
 
 -- ===================================================================
--- 5. ИСПРАВЛЕНИЕ ТАБЛИЦЫ GTB_preset_exercises
+-- 4. ПОДДЕРЖКА АДМИНСКОГО КАТАЛОГА (Глобальные упражнения)
+-- Чтобы отличать общедоступные упражнения от созданных лично пользователем,
+-- поле id_user в таблице упражнений теперь может принимать значение NULL (значит, упражнение общее)
 -- ===================================================================
-DECLARE @SqlPresetEx NVARCHAR(MAX) = (
-    SELECT 'ALTER TABLE GTB_preset_exercises DROP CONSTRAINT ' + name
-    FROM sys.foreign_keys
-    WHERE parent_object_id = OBJECT_ID('GTB_preset_exercises') 
-      AND referenced_object_id = OBJECT_ID('GTB_preset_workouts')
-);
-IF @SqlPresetEx IS NOT NULL EXEC sp_executesql @SqlPresetEx;
-
-IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_preset_exercises') AND name = 'preset_id')
-    EXEC sp_rename 'GTB_preset_exercises.preset_id', 'id_preset', 'COLUMN';
-
-IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_GTB_preset_exercises_Presets')
-    ALTER TABLE GTB_preset_exercises ADD CONSTRAINT FK_GTB_preset_exercises_Presets 
-    FOREIGN KEY (id_preset) REFERENCES GTB_preset_workouts(id_preset) ON DELETE CASCADE;
-
-
--- ===================================================================
--- 6. ИСПРАВЛЕНИЕ ТАБЛИЦЫ GTB_sets
--- ===================================================================
-IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('GTB_sets') AND name = 'workout_exercise_id')
-    EXEC sp_rename 'GTB_sets.workout_exercise_id', 'id_workout_exercise', 'COLUMN';
+ALTER TABLE GTB_workout_exercises ALTER COLUMN id_user INT NULL;

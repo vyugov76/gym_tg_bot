@@ -207,6 +207,52 @@ async def add_category(user_id: int, category_name: str) -> int:
     return int(category_id)
 
 
+async def bulk_assign_exercises_to_category(
+    exercise_ids: list[int],
+    category_id: int,
+    id_user: int,
+) -> int:
+    """Назначает несортированные упражнения в категорию. Возвращает число обновлённых строк."""
+    if not exercise_ids:
+        return 0
+    placeholders = ",".join("?" * len(exercise_ids))
+    await _run_query(
+        f"""
+        UPDATE GTB_workout_exercises
+        SET category_id = ?
+        WHERE id_workout_exercise IN ({placeholders})
+          AND id_user = ?
+          AND workout_id IS NULL
+          AND category_id IS NULL
+        """,
+        (category_id, *exercise_ids, id_user),
+    )
+    return len(exercise_ids)
+
+
+async def bulk_unassign_exercises_from_category(
+    exercise_ids: list[int],
+    category_id: int,
+    id_user: int,
+) -> int:
+    """Сбрасывает category_id в NULL для упражнений категории."""
+    if not exercise_ids:
+        return 0
+    placeholders = ",".join("?" * len(exercise_ids))
+    await _run_query(
+        f"""
+        UPDATE GTB_workout_exercises
+        SET category_id = NULL
+        WHERE id_workout_exercise IN ({placeholders})
+          AND id_user = ?
+          AND category_id = ?
+          AND workout_id IS NULL
+        """,
+        (*exercise_ids, id_user, category_id),
+    )
+    return len(exercise_ids)
+
+
 async def delete_category(category_id: int, user_id: int) -> None:
     """Удаляет категорию. Упражнения получают category_id = NULL (ON DELETE SET NULL)."""
     await _run_query(
@@ -411,6 +457,79 @@ async def create_preset(user_id: int, preset_name: str) -> int:
         fetch="scalar",
     )
     return int(preset_id)
+
+
+async def get_max_preset_sequence_number(preset_id: int) -> int:
+    """Максимальный sequence_number в шаблоне (0 если пусто)."""
+    value = await _run_query(
+        """
+        SELECT ISNULL(MAX(sequence_number), 0)
+        FROM GTB_preset_exercises
+        WHERE id_preset = ?
+        """,
+        (preset_id,),
+        fetch="scalar",
+    )
+    return int(value or 0)
+
+
+async def bulk_add_global_exercises_to_preset(
+    preset_id: int,
+    global_exercise_ids: list[int],
+    id_user: int,
+) -> int:
+    """Добавляет глобальные упражнения в шаблон. Возвращает число добавленных."""
+    if not global_exercise_ids:
+        return 0
+
+    preset = await get_preset_by_id(preset_id)
+    if not preset or preset["id_user"] != id_user:
+        return 0
+
+    sequence = await get_max_preset_sequence_number(preset_id)
+    added = 0
+    for exercise_id in global_exercise_ids:
+        exercise = await get_exercise_by_id(exercise_id)
+        if (
+            not exercise
+            or exercise.get("workout_id") is not None
+            or exercise.get("id_user") != id_user
+        ):
+            continue
+        sequence += 1
+        await add_preset_exercise(
+            preset_id=preset_id,
+            exercise_name=exercise["name"],
+            exercise_type=exercise["is_bodyweight"],
+            sequence_number=sequence,
+        )
+        added += 1
+    return added
+
+
+async def bulk_delete_preset_exercises(
+    preset_exercise_ids: list[int],
+    preset_id: int,
+    id_user: int,
+) -> int:
+    """Удаляет упражнения из шаблона. Возвращает число переданных ID."""
+    if not preset_exercise_ids:
+        return 0
+
+    preset = await get_preset_by_id(preset_id)
+    if not preset or preset["id_user"] != id_user:
+        return 0
+
+    placeholders = ",".join("?" * len(preset_exercise_ids))
+    await _run_query(
+        f"""
+        DELETE FROM GTB_preset_exercises
+        WHERE id_preset_exercise IN ({placeholders})
+          AND id_preset = ?
+        """,
+        (*preset_exercise_ids, preset_id),
+    )
+    return len(preset_exercise_ids)
 
 
 async def add_preset_exercise(

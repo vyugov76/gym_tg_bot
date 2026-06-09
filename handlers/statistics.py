@@ -14,7 +14,11 @@ from aiogram_calendar.schemas import SimpleCalAct
 
 import database.requests as db
 from keyboards.workout_calendar import WorkoutCalendar
-from keyboards.workout_report import delete_confirm_keyboard, workout_report_keyboard
+from keyboards.workout_report import (
+    calendar_workout_report_keyboard,
+    delete_confirm_keyboard,
+    workout_report_keyboard,
+)
 from states.workout_states import WorkoutEditStates
 from utils.exercise_types import EXERCISE_BODYWEIGHT, EXERCISE_TIMED
 from utils.set_input import (
@@ -231,9 +235,46 @@ async def process_calendar_selection(
         )
         await callback.message.answer(
             format_calendar_workout(w_rows, selected_day),
-            reply_markup=workout_report_keyboard(workout_id),
+            reply_markup=calendar_workout_report_keyboard(
+                workout_id,
+                selected_day.year,
+                selected_day.month,
+            ),
         )
 
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^stats:back_calendar:\d+:\d+$"))
+async def back_to_calendar(callback: CallbackQuery) -> None:
+    """Возврат к сетке календаря с сохранением месяца и года."""
+    parts = callback.data.split(":")
+    year = int(parts[2])
+    month = int(parts[3])
+    telegram_id = callback.from_user.id
+
+    try:
+        user = await db.get_user_by_telegram_id(telegram_id)
+        if not user:
+            await callback.answer("Сначала нажмите /start", show_alert=True)
+            return
+
+        workout_calendar = WorkoutCalendar(user_id=user["id"], locale=CALENDAR_LOCALE)
+        markup = await workout_calendar.start_calendar(year=year, month=month)
+    except Exception:
+        logger.exception(
+            "Ошибка возврата в календарь: telegram_id=%s year=%s month=%s",
+            telegram_id,
+            year,
+            month,
+        )
+        await callback.answer("Не удалось открыть календарь", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "📅 Выберите день, чтобы посмотреть детали тренировки:",
+        reply_markup=markup,
+    )
     await callback.answer()
 
 
@@ -458,7 +499,16 @@ async def edit_workout_new_value(message: Message, state: FSMContext) -> None:
     )
     await state.clear()
 
+    if data.get("report_style") == "calendar" and calendar_date:
+        keyboard = calendar_workout_report_keyboard(
+            workout_id,
+            calendar_date.year,
+            calendar_date.month,
+        )
+    else:
+        keyboard = workout_report_keyboard(workout_id)
+
     await message.answer(
         f"Подход успешно изменён!\n\nОбновлённая статистика:\n\n{report}",
-        reply_markup=workout_report_keyboard(workout_id),
+        reply_markup=keyboard,
     )

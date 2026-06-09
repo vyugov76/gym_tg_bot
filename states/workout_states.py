@@ -37,6 +37,12 @@ class PresetSaveStates(StatesGroup):
     waiting_for_name = State()
 
 
+class PresetCreateStates(StatesGroup):
+    """Создание пустого шаблона тренировки в настройках."""
+
+    waiting_for_name = State()
+
+
 class EditExerciseStates(StatesGroup):
     """Редактирование упражнения в профиле."""
 

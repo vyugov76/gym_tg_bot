@@ -74,6 +74,14 @@ def category_detail_keyboard(category_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
+                text="➕ Добавить упражнения",
+                callback_data=f"cat:bulk_add:{category_id}",
+            )],
+            [InlineKeyboardButton(
+                text="➖ Удалить упражнения",
+                callback_data=f"cat:bulk_rm:{category_id}",
+            )],
+            [InlineKeyboardButton(
                 text="❌ Удалить категорию",
                 callback_data=f"cat:delete:{category_id}",
             )],
@@ -100,6 +108,10 @@ def presets_list_keyboard(presets: list[dict[str, Any]]) -> InlineKeyboardMarkup
             callback_data="preset:noop",
         )])
     buttons.append([InlineKeyboardButton(
+        text="➕ Создать шаблон",
+        callback_data="preset:create",
+    )])
+    buttons.append([InlineKeyboardButton(
         text="◀️ Назад в настройки",
         callback_data="settings:back",
     )])
@@ -110,6 +122,14 @@ def preset_detail_keyboard(preset_id: int) -> InlineKeyboardMarkup:
     """Действия внутри готовой тренировки."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(
+                text="➕ Добавить упражнения",
+                callback_data=f"preset:bulk_add:{preset_id}",
+            )],
+            [InlineKeyboardButton(
+                text="➖ Удалить упражнения",
+                callback_data=f"preset:bulk_rm:{preset_id}",
+            )],
             [InlineKeyboardButton(
                 text="❌ Удалить тренировку",
                 callback_data=f"preset:delete:{preset_id}",
