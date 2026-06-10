@@ -589,7 +589,7 @@ async def get_exercises_by_user_id(user_id: int) -> list[dict[str, Any]]:
 async def get_presets_by_user_id(user_id: int) -> list[dict[str, Any]]:
     return await _run_query(
         """
-        SELECT id_preset AS id, preset_name AS name
+        SELECT id_preset AS id, preset_name AS name, preset_name
         FROM GTB_preset_workouts
         WHERE id_user = ? AND is_deleted = 0
         ORDER BY preset_name
@@ -602,7 +602,7 @@ async def get_presets_by_user_id(user_id: int) -> list[dict[str, Any]]:
 async def get_preset_by_id(preset_id: int) -> dict[str, Any] | None:
     return await _run_query(
         """
-        SELECT id_preset AS id, id_user, preset_name AS name
+        SELECT id_preset AS id, id_user, preset_name AS name, preset_name
         FROM GTB_preset_workouts
         WHERE id_preset = ? AND is_deleted = 0
         """,
@@ -618,7 +618,8 @@ async def get_preset_exercises(preset_id: int) -> list[dict[str, Any]]:
             id_preset_exercise AS id,
             exercise_name AS name,
             is_bodyweight,
-            sequence_number
+            sequence_number,
+            sets_count
         FROM GTB_preset_exercises
         WHERE id_preset = ?
         ORDER BY sequence_number, id_preset_exercise
@@ -684,6 +685,7 @@ async def bulk_add_global_exercises_to_preset(
             exercise_name=exercise["name"],
             exercise_type=exercise["is_bodyweight"],
             sequence_number=sequence,
+            sets_count=0,
         )
         added += 1
     return added
@@ -719,18 +721,34 @@ async def add_preset_exercise(
     exercise_name: str,
     exercise_type: int,
     sequence_number: int,
+    sets_count: int = 0,
 ) -> int:
     preset_exercise_id = await _run_query(
         """
         INSERT INTO GTB_preset_exercises
-            (id_preset, exercise_name, is_bodyweight, sequence_number)
+            (id_preset, exercise_name, is_bodyweight, sequence_number, sets_count)
         OUTPUT INSERTED.id_preset_exercise
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (preset_id, exercise_name, exercise_type, sequence_number),
+        (preset_id, exercise_name, exercise_type, sequence_number, sets_count),
         fetch="scalar",
     )
     return int(preset_exercise_id)
+
+
+async def update_preset_exercise_sets_count(
+    preset_exercise_id: int,
+    preset_id: int,
+    sets_count: int,
+) -> None:
+    await _run_query(
+        """
+        UPDATE GTB_preset_exercises
+        SET sets_count = ?
+        WHERE id_preset_exercise = ? AND id_preset = ?
+        """,
+        (sets_count, preset_exercise_id, preset_id),
+    )
 
 
 async def delete_preset(preset_id: int, user_id: int) -> None:
@@ -776,20 +794,126 @@ async def create_preset_from_workout(
     return preset_id
 
 
+async def get_workout_exercises_with_set_counts(
+    workout_id: int,
+) -> list[dict[str, Any]]:
+    """Упражнения тренировки с фактическим числом подходов (порядок первого появления)."""
+    rows = await _run_query(
+        """
+        SELECT
+            we.exercise_name AS name,
+            we.is_bodyweight,
+            MIN(we.id_workout_exercise) AS first_id,
+            COUNT(s.id_set) AS performed_sets
+        FROM GTB_workout_exercises we
+        LEFT JOIN GTB_sets s
+            ON s.id_workout_exercise = we.id_workout_exercise
+        WHERE we.workout_id = ?
+        GROUP BY we.exercise_name, we.is_bodyweight
+        ORDER BY MIN(we.id_workout_exercise)
+        """,
+        (workout_id,),
+        fetch="all",
+    )
+    result = []
+    for row in rows:
+        normalized = _normalize_exercise_row(row)
+        normalized["performed_sets"] = int(row.get("performed_sets") or 0)
+        result.append(normalized)
+    return result
+
+
 async def copy_workout_exercises_to_preset(
     preset_id: int,
     workout_id: int,
 ) -> int:
     """Копирует упражнения тренировки в шаблон (порядок первого появления)."""
-    exercises = await get_unique_workout_exercises_ordered(workout_id)
+    exercises = await get_workout_exercises_with_set_counts(workout_id)
     for seq, exercise in enumerate(exercises, start=1):
         await add_preset_exercise(
             preset_id=preset_id,
             exercise_name=exercise["name"],
             exercise_type=exercise["is_bodyweight"],
             sequence_number=seq,
+            sets_count=int(exercise.get("performed_sets") or 0),
         )
     return len(exercises)
+
+
+async def get_previous_finished_workout_id(
+    user_id: int,
+    preset_id: int,
+    *,
+    exclude_workout_id: int | None = None,
+) -> int | None:
+    """Последняя завершённая тренировка по тому же шаблону (кроме exclude)."""
+    if exclude_workout_id is not None:
+        workout_id = await _run_query(
+            """
+            SELECT TOP 1 id_workout
+            FROM GTB_workouts
+            WHERE id_user = ?
+              AND id_preset = ?
+              AND finished_at IS NOT NULL
+              AND id_workout <> ?
+            ORDER BY finished_at DESC
+            """,
+            (user_id, preset_id, exclude_workout_id),
+            fetch="scalar",
+        )
+    else:
+        workout_id = await _run_query(
+            """
+            SELECT TOP 1 id_workout
+            FROM GTB_workouts
+            WHERE id_user = ?
+              AND id_preset = ?
+              AND finished_at IS NOT NULL
+            ORDER BY finished_at DESC
+            """,
+            (user_id, preset_id),
+            fetch="scalar",
+        )
+    return int(workout_id) if workout_id is not None else None
+
+
+async def get_previous_set_for_exercise(
+    user_id: int,
+    preset_id: int,
+    exercise_name: str,
+    exercise_type: int,
+    set_number: int,
+    *,
+    exclude_workout_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Подход с тем же номером из предыдущей тренировки по шаблону."""
+    prev_workout_id = await get_previous_finished_workout_id(
+        user_id,
+        preset_id,
+        exclude_workout_id=exclude_workout_id,
+    )
+    if prev_workout_id is None:
+        return None
+    return await _run_query(
+        """
+        SELECT TOP 1
+            s.set_number,
+            s.weight,
+            s.reps,
+            s.duration_seconds,
+            s.distance_meters
+        FROM GTB_sets s
+        INNER JOIN GTB_workout_exercises we
+            ON we.id_workout_exercise = s.id_workout_exercise
+        WHERE we.workout_id = ?
+          AND we.exercise_name = ?
+          AND we.is_bodyweight = ?
+          AND s.set_number = ?
+        ORDER BY s.id_set DESC
+        """,
+        (prev_workout_id, exercise_name, exercise_type, set_number),
+        fetch="one",
+    )
 
 
 async def replace_preset_exercises_from_workout(

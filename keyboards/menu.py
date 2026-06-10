@@ -10,6 +10,7 @@ from aiogram.types import (
 )
 
 from utils.exercise_types import EXERCISE_ICONS, NEXT_TYPE_BUTTON, normalize_exercise_type
+from utils.preset_helpers import preset_button_text
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -97,7 +98,7 @@ def presets_list_keyboard(presets: list[dict[str, Any]]) -> InlineKeyboardMarkup
     """Список готовых тренировок в настройках."""
     buttons = [
         [InlineKeyboardButton(
-            text=f"📋 {preset['name']}",
+            text=preset_button_text(preset),
             callback_data=f"preset:view:{preset['id']}",
         )]
         for preset in presets
@@ -118,6 +119,25 @@ def presets_list_keyboard(presets: list[dict[str, Any]]) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def template_edit_sets_keyboard(
+    preset_id: int,
+    exercises: list[dict[str, Any]],
+) -> InlineKeyboardMarkup:
+    """Выбор упражнения для изменения количества подходов в шаблоне."""
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{idx}) {ex['name']}",
+            callback_data=f"preset:edit_sets:pick:{preset_id}:{idx - 1}",
+        )]
+        for idx, ex in enumerate(exercises, start=1)
+    ]
+    buttons.append([InlineKeyboardButton(
+        text="✅ Готово / Назад",
+        callback_data=f"preset:edit_sets:done:{preset_id}",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def preset_detail_keyboard(preset_id: int) -> InlineKeyboardMarkup:
     """Действия внутри готовой тренировки."""
     return InlineKeyboardMarkup(
@@ -129,6 +149,10 @@ def preset_detail_keyboard(preset_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(
                 text="➖ Удалить упражнения",
                 callback_data=f"preset:bulk_rm:{preset_id}",
+            )],
+            [InlineKeyboardButton(
+                text="✏️ Изменить подходы",
+                callback_data=f"preset:edit_sets:{preset_id}",
             )],
             [InlineKeyboardButton(
                 text="❌ Удалить тренировку",
@@ -162,7 +186,7 @@ def workout_preset_list_keyboard(presets: list[dict[str, Any]]) -> InlineKeyboar
     """Список пресетов для старта тренировки."""
     buttons = [
         [InlineKeyboardButton(
-            text=f"📋 {preset['name']}",
+            text=preset_button_text(preset),
             callback_data=f"workout:start:preset:{preset['id']}",
         )]
         for preset in presets
@@ -282,6 +306,24 @@ def after_set_keyboard(*, show_preset_next: bool = False) -> InlineKeyboardMarku
                 text="✅ Завершить тренировку",
                 callback_data="set:finish",
             )],
+        ]
+    )
+
+
+def extra_set_confirm_keyboard() -> InlineKeyboardMarkup:
+    """Подтверждение дополнительного подхода сверх плана шаблона."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Да, добавить",
+                    callback_data="set:more:confirm",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="set:more:cancel",
+                ),
+            ],
         ]
     )
 

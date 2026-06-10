@@ -15,11 +15,19 @@ from keyboards.menu import (
     my_exercises_keyboard,
     preset_detail_keyboard,
     presets_list_keyboard,
+    template_edit_sets_keyboard,
     profile_keyboard,
     settings_menu_keyboard,
 )
-from states.workout_states import CategoryStates, PresetCreateStates, ProfileEditStates
+from states.workout_states import (
+    CategoryStates,
+    PresetBulkAddStates,
+    PresetCreateStates,
+    ProfileEditStates,
+    TemplateEditStates,
+)
 from utils.exercise_types import EXERCISE_TYPE_LABELS, normalize_exercise_type
+from utils.preset_helpers import format_preset_exercises_list, parse_sets_count_input
 
 router = Router(name="settings")
 logger = logging.getLogger(__name__)
@@ -33,12 +41,114 @@ def _type_label(exercise: dict) -> str:
 
 
 def _format_preset_exercises(exercises: list[dict]) -> str:
-    if not exercises:
-        return "В программе пока нет упражнений."
-    lines = []
+    return format_preset_exercises_list(exercises)
+
+
+async def _build_preset_add_queue(
+    exercise_ids: list[int],
+    id_user: int,
+) -> list[dict]:
+    queue: list[dict] = []
+    for exercise_id in exercise_ids:
+        exercise = await db.get_exercise_by_id(exercise_id)
+        if not exercise or exercise.get("workout_id") is not None:
+            continue
+        ex_owner = exercise.get("id_user")
+        if ex_owner is not None and ex_owner != id_user:
+            continue
+        queue.append({
+            "name": exercise["name"],
+            "exercise_type": exercise["is_bodyweight"],
+        })
+    return queue
+
+
+async def _prompt_preset_add_sets_count(
+    target: CallbackQuery | Message,
+    state: FSMContext,
+    exercise: dict,
+    index: int,
+    total: int,
+) -> None:
+    text = (
+        f"Упражнение {index + 1}/{total}: <b>{exercise['name']}</b>\n"
+        f"Введите количество подходов для этого упражнения "
+        f"(0 - не указывать):"
+    )
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text)
+    else:
+        await target.answer(text)
+
+
+def _format_template_edit_list(exercises: list[dict]) -> str:
+    lines = [
+        "Выберите номер упражнения для изменения количества подходов "
+        "или нажмите 'Готово':",
+    ]
     for idx, ex in enumerate(exercises, start=1):
-        lines.append(f"{idx}) {ex['name']} — {_type_label(ex)}")
+        sets_count = int(ex.get("sets_count") or 0)
+        lines.append(f"{idx}) {ex['name']} (сейчас: {sets_count})")
     return "\n".join(lines)
+
+
+async def _show_template_edit_selection(
+    target: CallbackQuery | Message,
+    state: FSMContext,
+    preset_id: int,
+    exercises: list[dict],
+    *,
+    notice: str | None = None,
+) -> None:
+    await state.update_data(
+        template_edit_preset_id=preset_id,
+        template_edit_exercises=exercises,
+    )
+    await state.set_state(TemplateEditStates.waiting_for_exercise_selection)
+
+    text = _format_template_edit_list(exercises)
+    if notice:
+        text = f"{notice}\n\n{text}"
+    keyboard = template_edit_sets_keyboard(preset_id, exercises)
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=keyboard)
+    else:
+        await target.answer(text, reply_markup=keyboard)
+
+
+async def _begin_template_edit_sets_count(
+    target: CallbackQuery | Message,
+    state: FSMContext,
+    preset_id: int,
+    exercises: list[dict],
+    index: int,
+) -> None:
+    if index < 0 or index >= len(exercises):
+        msg = "Номер вне списка. Выберите упражнение из списка."
+        if isinstance(target, CallbackQuery):
+            await target.answer(msg, show_alert=True)
+        else:
+            await target.answer(msg)
+        return
+
+    exercise = exercises[index]
+    await state.update_data(
+        template_edit_preset_id=preset_id,
+        template_edit_exercises=exercises,
+        template_edit_exercise_id=int(exercise["id"]),
+    )
+    await state.set_state(TemplateEditStates.waiting_for_sets_count)
+
+    prompt = (
+        f"Упражнение: <b>{exercise['name']}</b>. "
+        f"Введите новое количество подходов (0 - не указывать):"
+    )
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(prompt)
+        await target.answer()
+    else:
+        await target.answer(prompt)
 
 
 async def _render_category_view(
@@ -704,15 +814,25 @@ async def bulk_confirm(callback: CallbackQuery, state: FSMContext) -> None:
                 notice=f"✅ Убрано из категории: {count}",
             )
         elif mode == "preset_add":
-            count = await db.bulk_add_global_exercises_to_preset(
-                context_id, selected, user["id"]
+            queue = await _build_preset_add_queue(selected, user["id"])
+            if not queue:
+                await callback.answer(
+                    "Нет упражнений для добавления",
+                    show_alert=True,
+                )
+                return
+            await state.update_data(
+                preset_add_preset_id=context_id,
+                preset_add_queue=queue,
+                preset_add_index=0,
+                bulk_selected_ids=[],
             )
-            await _render_preset_view(
-                callback,
-                context_id,
-                user["id"],
-                notice=f"✅ Добавлено в шаблон: {count}",
+            await state.set_state(PresetBulkAddStates.waiting_for_sets_count)
+            await _prompt_preset_add_sets_count(
+                callback, state, queue[0], 0, len(queue)
             )
+            await callback.answer()
+            return
         elif mode == "preset_rm":
             count = await db.bulk_delete_preset_exercises(
                 selected, context_id, user["id"]
@@ -757,3 +877,217 @@ async def bulk_cancel(callback: CallbackQuery, state: FSMContext) -> None:
         await _render_preset_view(callback, context_id, user["id"])
 
     await callback.answer("Отменено")
+
+
+@router.message(PresetBulkAddStates.waiting_for_sets_count)
+async def preset_bulk_add_sets_count(message: Message, state: FSMContext) -> None:
+    sets_count = parse_sets_count_input(message.text)
+    if sets_count is None:
+        await message.answer(
+            "Введите целое число от 0 и выше (0 - не указывать количество подходов):"
+        )
+        return
+
+    data = await state.get_data()
+    preset_id = data.get("preset_add_preset_id")
+    queue: list[dict] = list(data.get("preset_add_queue", []))
+    index = int(data.get("preset_add_index", 0))
+    user = await db.get_user_by_telegram_id(message.from_user.id)
+    if not user or not preset_id or index >= len(queue):
+        await state.clear()
+        await message.answer("Данные шаблона потеряны. Начните заново.")
+        return
+
+    exercise = queue[index]
+    try:
+        sequence = await db.get_max_preset_sequence_number(preset_id) + 1
+        await db.add_preset_exercise(
+            preset_id=preset_id,
+            exercise_name=exercise["name"],
+            exercise_type=exercise["exercise_type"],
+            sequence_number=sequence,
+            sets_count=sets_count,
+        )
+    except Exception:
+        logger.exception(
+            "Ошибка добавления упражнения в шаблон: preset_id=%s",
+            preset_id,
+        )
+        await message.answer("Не удалось сохранить упражнение. Попробуйте позже.")
+        return
+
+    index += 1
+    if index < len(queue):
+        await state.update_data(preset_add_index=index)
+        await _prompt_preset_add_sets_count(
+            message, state, queue[index], index, len(queue)
+        )
+        return
+
+    await state.clear()
+    await _render_preset_view(
+        message,
+        preset_id,
+        user["id"],
+        notice=f"✅ Добавлено в шаблон: {len(queue)}",
+    )
+
+
+@router.callback_query(
+    TemplateEditStates.waiting_for_exercise_selection,
+    F.data.regexp(r"^preset:edit_sets:pick:\d+:\d+$"),
+)
+async def preset_edit_sets_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    logger.info(
+        "Inline-кнопка: user_id=%s callback_data=%s",
+        callback.from_user.id,
+        callback.data,
+    )
+    parts = callback.data.split(":")
+    preset_id = int(parts[3])
+    index = int(parts[4])
+
+    user = await db.get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала нажмите /start", show_alert=True)
+        return
+
+    preset = await db.get_preset_by_id(preset_id)
+    if not preset or preset["id_user"] != user["id"]:
+        await callback.answer("Программа не найдена", show_alert=True)
+        return
+
+    data = await state.get_data()
+    exercises: list[dict] = list(data.get("template_edit_exercises", []))
+    if not exercises or data.get("template_edit_preset_id") != preset_id:
+        exercises = await db.get_preset_exercises(preset_id)
+
+    await _begin_template_edit_sets_count(
+        callback, state, preset_id, exercises, index
+    )
+
+
+@router.callback_query(
+    TemplateEditStates.waiting_for_exercise_selection,
+    F.data.regexp(r"^preset:edit_sets:done:\d+$"),
+)
+async def preset_edit_sets_done(callback: CallbackQuery, state: FSMContext) -> None:
+    logger.info(
+        "Inline-кнопка: user_id=%s callback_data=%s",
+        callback.from_user.id,
+        callback.data,
+    )
+    preset_id = int(callback.data.split(":")[-1])
+    user = await db.get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала нажмите /start", show_alert=True)
+        return
+
+    preset = await db.get_preset_by_id(preset_id)
+    if not preset or preset["id_user"] != user["id"]:
+        await callback.answer("Программа не найдена", show_alert=True)
+        return
+
+    await state.clear()
+    await _render_preset_view(callback, preset_id, user["id"])
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^preset:edit_sets:\d+$"))
+async def preset_edit_sets_start(callback: CallbackQuery, state: FSMContext) -> None:
+    logger.info(
+        "Inline-кнопка: user_id=%s callback_data=%s",
+        callback.from_user.id,
+        callback.data,
+    )
+    preset_id = int(callback.data.split(":")[-1])
+    user = await db.get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала нажмите /start", show_alert=True)
+        return
+
+    preset = await db.get_preset_by_id(preset_id)
+    if not preset or preset["id_user"] != user["id"]:
+        await callback.answer("Программа не найдена", show_alert=True)
+        return
+
+    exercises = await db.get_preset_exercises(preset_id)
+    if not exercises:
+        await callback.answer("В шаблоне нет упражнений", show_alert=True)
+        return
+
+    await _show_template_edit_selection(callback, state, preset_id, exercises)
+    await callback.answer()
+
+
+@router.message(TemplateEditStates.waiting_for_exercise_selection)
+async def preset_edit_sets_select_by_number(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer(
+            "Введите номер упражнения из списка или используйте кнопки ниже."
+        )
+        return
+
+    data = await state.get_data()
+    preset_id = data.get("template_edit_preset_id")
+    exercises: list[dict] = list(data.get("template_edit_exercises", []))
+    user = await db.get_user_by_telegram_id(message.from_user.id)
+    if not user or not preset_id or not exercises:
+        await state.clear()
+        await message.answer("Данные шаблона потеряны. Начните заново.")
+        return
+
+    await _begin_template_edit_sets_count(
+        message,
+        state,
+        preset_id,
+        exercises,
+        int(text) - 1,
+    )
+
+
+@router.message(TemplateEditStates.waiting_for_sets_count)
+async def preset_edit_sets_apply(message: Message, state: FSMContext) -> None:
+    sets_count = parse_sets_count_input(message.text)
+    if sets_count is None:
+        await message.answer(
+            "Введите целое число от 0 и выше (0 - не указывать количество подходов):"
+        )
+        return
+
+    data = await state.get_data()
+    preset_id = data.get("template_edit_preset_id")
+    exercise_id = data.get("template_edit_exercise_id")
+    user = await db.get_user_by_telegram_id(message.from_user.id)
+    if not user or not preset_id or not exercise_id:
+        await state.clear()
+        await message.answer("Данные шаблона потеряны. Начните заново.")
+        return
+
+    try:
+        await db.update_preset_exercise_sets_count(
+            int(exercise_id),
+            preset_id,
+            sets_count,
+        )
+    except Exception:
+        logger.exception(
+            "Ошибка обновления подходов шаблона: preset_id=%s exercise_id=%s",
+            preset_id,
+            exercise_id,
+        )
+        await message.answer("Не удалось сохранить. Попробуйте ещё раз.")
+        return
+
+    exercises = await db.get_preset_exercises(preset_id)
+    await _show_template_edit_selection(
+        message,
+        state,
+        preset_id,
+        exercises,
+        notice="✅ Количество подходов обновлено",
+    )

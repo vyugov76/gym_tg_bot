@@ -11,6 +11,7 @@ from keyboards.menu import (
     after_set_keyboard,
     exercise_category_keyboard,
     exercise_type_keyboard,
+    extra_set_confirm_keyboard,
     main_menu_keyboard,
     preset_program_complete_keyboard,
     template_save_keyboard,
@@ -36,7 +37,8 @@ from utils.set_input import (
     parse_weighted_set,
 )
 from utils.text_helpers import format_exercise_time
-from utils.workout_display import format_finish_workout
+from utils.workout_display import format_finish_workout, format_weight
+from utils.workout_progress import format_set_value_for_display
 
 router = Router(name="workout")
 logger = logging.getLogger(__name__)
@@ -75,24 +77,62 @@ def _is_preset_sequence_active(data: dict) -> bool:
     )
 
 
-def _set_prompt(exercise_name: str, set_number: int, exercise_type: int) -> str:
-    exercise_type = normalize_exercise_type(exercise_type)
+def _set_number_label(set_number: int, planned_sets: int) -> str:
+    if planned_sets > 0:
+        return f"Подход {set_number}/{planned_sets}"
+    return f"Подход {set_number}"
+
+
+def _example_suffix(previous_hint: str | None, default_example: str) -> str:
+    if previous_hint:
+        return f"(прошлая тренировка: {previous_hint})"
+    return default_example
+
+
+async def _previous_set_hint(data: dict, set_number: int) -> str | None:
+    preset_id = data.get("preset_id")
+    db_user_id = data.get("db_user_id")
+    exercise_name = data.get("exercise_name")
+    exercise_type = data.get("exercise_type")
+    workout_id = data.get("workout_id")
+    if not preset_id or not db_user_id or not exercise_name:
+        return None
+    prev = await db.get_previous_set_for_exercise(
+        db_user_id,
+        preset_id,
+        exercise_name,
+        normalize_exercise_type(exercise_type),
+        set_number,
+        exclude_workout_id=workout_id,
+    )
+    if not prev:
+        return None
+    return format_set_value_for_display(prev, normalize_exercise_type(exercise_type))
+
+
+async def _build_set_prompt(data: dict, set_number: int) -> str:
+    exercise_name = data["exercise_name"]
+    exercise_type = normalize_exercise_type(data.get("exercise_type"))
+    planned_sets = int(data.get("planned_sets_count") or 0)
+    set_label = _set_number_label(set_number, planned_sets)
+    prev_hint = await _previous_set_hint(data, set_number)
+
     if exercise_type == EXERCISE_BODYWEIGHT:
+        example = _example_suffix(prev_hint, "например, 12")
         return (
             f"Упражнение: <b>{exercise_name}</b> (собственный вес)\n"
-            f"Подход {set_number} — введите <b>количество повторений</b> "
-            f"(например, 12):"
+            f"{set_label} - введите <b>количество повторений</b> {example}:"
         )
     if exercise_type == EXERCISE_TIMED:
+        example = _example_suffix(prev_hint, "например, 30 или 1:30")
         return (
             f"Упражнение: <b>{exercise_name}</b> (на время)\n"
-            f"Подход {set_number} — введите <b>время</b> "
-            f"(например, 30 или 1:30):"
+            f"{set_label} - введите <b>время</b> {example}:"
         )
+    example = _example_suffix(prev_hint, "например, 60/10")
     return (
         f"Упражнение: <b>{exercise_name}</b>\n"
-        f"Подход {set_number} — введите <b>вес/повторения</b> "
-        f"(например, 60/10):"
+        f"{set_label} - введите <b>вес/повторения</b> {example}:"
     )
 
 
@@ -153,19 +193,35 @@ def _format_set_recorded_message(
     set_number: int,
     exercise_type: int,
     values: dict[str, float | int | None],
+    *,
+    planned_sets: int = 0,
 ) -> str:
     exercise_type = normalize_exercise_type(exercise_type)
+    label = _set_number_label(set_number, planned_sets)
     if exercise_type == EXERCISE_BODYWEIGHT:
         return (
-            f"✅ Подход {set_number} записан: {values['reps']} повторений "
-            f"(собственный вес)"
+            f"✅ {label} записан: {values['reps']} повторений (собственный вес)"
         )
     if exercise_type == EXERCISE_TIMED:
         return (
-            f"✅ Подход {set_number} записан: "
+            f"✅ {label} записан: "
             f"{format_exercise_time(int(values['duration_seconds']))}"
         )
-    return f"✅ Подход {set_number} записан: {values['weight']} кг × {values['reps']}"
+    return (
+        f"✅ {label} записан: "
+        f"{format_weight(values['weight'])} кг x {values['reps']}"
+    )
+
+
+async def _mark_sets_deviation_if_needed(state: FSMContext) -> None:
+    """Фиксирует отклонение от планового числа подходов в шаблоне."""
+    data = await state.get_data()
+    planned = int(data.get("planned_sets_count") or 0)
+    if planned <= 0 or not _is_preset_workout(data):
+        return
+    completed = int(data.get("set_number", 1)) - 1
+    if completed != planned:
+        await state.update_data(preset_sets_deviated=True)
 
 
 def _after_set_keyboard(data: dict):
@@ -206,6 +262,8 @@ async def _init_workout_state(
         empty_workout=preset_id is None,
         browse_category_id=None,
         is_preset_modified=False,
+        preset_sets_deviated=False,
+        planned_sets_count=0,
         is_new_set=False,
         set_id=None,
     )
@@ -230,11 +288,34 @@ async def _mark_preset_modified_if_needed(
         await state.update_data(is_preset_modified=True)
 
 
-def _build_finish_report(workout_id: int, data: dict, rows: list[dict]) -> tuple[str, object]:
+async def _load_previous_workout_rows(
+    data: dict,
+    workout_id: int,
+) -> list[dict] | None:
+    preset_id = data.get("preset_id")
+    db_user_id = data.get("db_user_id")
+    if not preset_id or not db_user_id:
+        return None
+    prev_id = await db.get_previous_finished_workout_id(
+        db_user_id,
+        preset_id,
+        exclude_workout_id=workout_id,
+    )
+    if prev_id is None:
+        return None
+    return await db.get_workout_detail_by_id(prev_id)
+
+
+async def _build_finish_report(
+    workout_id: int,
+    data: dict,
+    rows: list[dict],
+) -> tuple[str, object]:
     """Формирует текст отчёта и клавиатуру после завершения тренировки."""
     show_save = bool(data.get("empty_workout")) and bool(rows)
+    previous_rows = await _load_previous_workout_rows(data, workout_id)
     if rows:
-        report = format_finish_workout(rows)
+        report = format_finish_workout(rows, previous_rows=previous_rows)
     else:
         report = "🎉 Тренировка завершена! Отличная работа!"
     return report, workout_report_keyboard(workout_id, show_save_preset=show_save)
@@ -255,7 +336,7 @@ async def _complete_workout_and_show_report(
         await callback.answer("Ошибка при сохранении тренировки", show_alert=True)
         return
 
-    report, keyboard = _build_finish_report(workout_id, data, rows)
+    report, keyboard = await _build_finish_report(workout_id, data, rows)
     await state.clear()
     await callback.message.edit_text(report, reply_markup=keyboard)
     await callback.answer("Тренировка сохранена!")
@@ -336,6 +417,8 @@ async def _start_workout_exercise(
     exercise_name: str,
     exercise_type: int,
     category_id: int | None = None,
+    *,
+    planned_sets_count: int = 0,
 ) -> None:
     data = await state.get_data()
     telegram_id = (
@@ -358,13 +441,15 @@ async def _start_workout_exercise(
         workout_exercise_id=workout_exercise_id,
         exercise_name=exercise_name,
         exercise_type=exercise_type,
+        planned_sets_count=planned_sets_count,
         set_number=1,
         is_new_set=False,
         set_id=None,
     )
     await _transition_state(state, telegram_id, WorkoutStates.waiting_for_set_value)
 
-    prompt = _set_prompt(exercise_name, 1, exercise_type)
+    data = await state.get_data()
+    prompt = await _build_set_prompt(data, 1)
     if isinstance(callback, CallbackQuery):
         await callback.message.edit_text(prompt)
     else:
@@ -456,6 +541,7 @@ async def _start_next_preset_exercise(
         state,
         exercise["name"],
         exercise["exercise_type"],
+        planned_sets_count=int(exercise.get("sets_count") or 0),
     )
     return True
 
@@ -564,7 +650,11 @@ async def start_preset_workout(callback: CallbackQuery, state: FSMContext) -> No
         return
 
     preset_queue = [
-        {"name": ex["name"], "exercise_type": ex["exercise_type"]}
+        {
+            "name": ex["name"],
+            "exercise_type": ex["exercise_type"],
+            "sets_count": int(ex.get("sets_count") or 0),
+        }
         for ex in exercises
     ]
 
@@ -773,6 +863,7 @@ async def next_exercise(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
 
     if _is_preset_sequence_active(data):
+        await _mark_sets_deviation_if_needed(state)
         await _start_next_preset_exercise(callback, state)
         await callback.answer()
         return
@@ -788,12 +879,12 @@ async def next_exercise(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "set:more")
-async def add_more_set(callback: CallbackQuery, state: FSMContext) -> None:
-    _log_callback(callback)
+async def _prompt_next_set(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
     data = await state.get_data()
     set_number = data.get("set_number", 1)
-    exercise_type = normalize_exercise_type(data.get("exercise_type"))
 
     await state.update_data(is_new_set=False, set_id=None)
     await _transition_state(
@@ -801,10 +892,41 @@ async def add_more_set(callback: CallbackQuery, state: FSMContext) -> None:
         callback.from_user.id,
         WorkoutStates.waiting_for_set_value,
     )
-    await callback.message.answer(
-        _set_prompt(data["exercise_name"], set_number, exercise_type)
-    )
+    prompt = await _build_set_prompt(data, set_number)
+    await callback.message.answer(prompt)
+
+
+@router.callback_query(F.data == "set:more")
+async def add_more_set(callback: CallbackQuery, state: FSMContext) -> None:
+    _log_callback(callback)
+    data = await state.get_data()
+    set_number = data.get("set_number", 1)
+    planned = int(data.get("planned_sets_count") or 0)
+
+    if planned > 0 and set_number > planned:
+        await callback.message.answer(
+            "Вы уверены, что хотите отойти от программы?",
+            reply_markup=extra_set_confirm_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    await _prompt_next_set(callback, state)
     await callback.answer()
+
+
+@router.callback_query(F.data == "set:more:confirm")
+async def add_more_set_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    _log_callback(callback)
+    await state.update_data(preset_sets_deviated=True)
+    await _prompt_next_set(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "set:more:cancel")
+async def add_more_set_cancel(callback: CallbackQuery) -> None:
+    _log_callback(callback)
+    await callback.answer("Дополнительный подход не добавлен")
 
 
 @router.callback_query(F.data == "set:edit_last")
@@ -842,10 +964,10 @@ async def edit_last_set(callback: CallbackQuery, state: FSMContext) -> None:
         WorkoutStates.waiting_for_set_value,
     )
 
-    exercise_type = normalize_exercise_type(data.get("exercise_type"))
+    data = await state.get_data()
+    prompt = await _build_set_prompt(data, deleted_set_number)
     await callback.message.answer(
-        f"Подход {deleted_set_number} удалён. Введите данные заново:\n\n"
-        f"{_set_prompt(data['exercise_name'], deleted_set_number, exercise_type)}"
+        f"Подход {deleted_set_number} удалён. Введите данные заново:\n\n{prompt}"
     )
     await callback.answer()
 
@@ -875,7 +997,13 @@ async def process_set(message: Message, state: FSMContext) -> None:
     )
     data = await state.get_data()
 
-    result_text = _format_set_recorded_message(set_number, exercise_type, values)
+    planned_sets = int(data.get("planned_sets_count") or 0)
+    result_text = _format_set_recorded_message(
+        set_number,
+        exercise_type,
+        values,
+        planned_sets=planned_sets,
+    )
     await message.answer(
         f"{result_text}\n\nЧто дальше?",
         reply_markup=_after_set_keyboard(data),
@@ -892,10 +1020,14 @@ async def finish_workout(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Активная тренировка не найдена", show_alert=True)
         return
 
-    if _is_preset_workout(data) and data.get("is_preset_modified"):
+    await _mark_sets_deviation_if_needed(state)
+    data = await state.get_data()
+
+    if _is_preset_workout(data) and (
+        data.get("is_preset_modified") or data.get("preset_sets_deviated")
+    ):
         await callback.message.edit_text(
-            "Вы добавили новые упражнения в процессе тренировки. "
-            "Хотите обновить шаблон?",
+            "Тренировка отличается от шаблона. Хотите обновить программу?",
             reply_markup=template_save_keyboard(),
         )
         await callback.answer()
@@ -1016,7 +1148,7 @@ async def template_save_new_finish(message: Message, state: FSMContext) -> None:
         await message.answer("Шаблон сохранён, но тренировка не завершена. Попробуйте позже.")
         return
 
-    report, keyboard = _build_finish_report(workout_id, data, rows)
+    report, keyboard = await _build_finish_report(workout_id, data, rows)
     await state.clear()
     await message.answer(
         f"✅ Шаблон <b>{name}</b> сохранён! Упражнений: {len(exercises)}\n\n{report}",

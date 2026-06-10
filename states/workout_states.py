@@ -44,6 +44,19 @@ class PresetCreateStates(StatesGroup):
     waiting_for_name = State()
 
 
+class PresetBulkAddStates(StatesGroup):
+    """Пошаговое добавление упражнений в шаблон с указанием подходов."""
+
+    waiting_for_sets_count = State()
+
+
+class TemplateEditStates(StatesGroup):
+    """Точечное редактирование количества подходов в существующем шаблоне."""
+
+    waiting_for_exercise_selection = State()
+    waiting_for_sets_count = State()
+
+
 class EditExerciseStates(StatesGroup):
     """Редактирование упражнения в профиле."""
 

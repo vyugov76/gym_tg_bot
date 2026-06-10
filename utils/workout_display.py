@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 
 from utils.exercise_types import (
     EXERCISE_BODYWEIGHT,
@@ -11,15 +11,26 @@ from utils.exercise_types import (
     normalize_exercise_type,
 )
 from utils.text_helpers import format_exercise_time, get_approach_string
+from utils.workout_progress import (
+    build_previous_sets_map,
+    compare_set_progress,
+    format_set_value_for_display,
+)
 
 
 def to_local_datetime(dt: datetime | None) -> datetime | None:
-    """Приводит naive datetime из БД (UTC) к локальному времени."""
+    """
+    Время из БД для отображения.
+
+    SQL Server пишет started_at/finished_at как локальное «настенное» время
+    (SYSDATETIME / GETDATE или явный INSERT). Naive datetime возвращаем как есть.
+    Если драйвер вернул tz-aware значение - приводим к локальной зоне ОС.
+    """
     if dt is None:
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone().replace(tzinfo=None)
+    if dt.tzinfo is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    return dt
 
 
 def format_weight(value: float | None) -> str:
@@ -57,18 +68,26 @@ def _set_duration_seconds(set_row: dict) -> int:
     return 0
 
 
-def _format_set_parts(exercise_type: int, sets: list[dict]) -> str:
-    if exercise_type == EXERCISE_BODYWEIGHT:
-        return " ".join(f"{s['reps']} повт." for s in sets if s.get("reps") is not None)
-    if exercise_type == EXERCISE_TIMED:
-        return " ".join(
-            format_exercise_time(_set_duration_seconds(s)) for s in sets
-        )
-    return " ".join(
-        f"{format_weight(s['weight'])}/{s['reps']}"
-        for s in sets
-        if s.get("reps") is not None
-    )
+def _format_set_parts(
+    exercise_type: int,
+    sets: list[dict],
+    *,
+    exercise_name: str | None = None,
+    previous_sets_map: dict[tuple[str, int, int], dict] | None = None,
+) -> str:
+    exercise_type = normalize_exercise_type(exercise_type)
+    parts: list[str] = []
+    for s in sets:
+        value = format_set_value_for_display(s, exercise_type)
+        if not value:
+            continue
+        prefix = ""
+        if previous_sets_map is not None and exercise_name is not None:
+            key = (exercise_name, exercise_type, int(s["set_number"]))
+            prev = previous_sets_map.get(key)
+            prefix = compare_set_progress(s, prev, exercise_type)
+        parts.append(f"{prefix}{value}")
+    return " ".join(parts)
 
 
 def get_exercises_from_rows(rows: list[dict]) -> list[dict]:
@@ -87,8 +106,15 @@ def get_exercises_from_rows(rows: list[dict]) -> list[dict]:
     return [exercises[k] for k in sorted(exercises.keys())]
 
 
-def format_exercise_lines(rows: list[dict]) -> list[str]:
+def format_exercise_lines(
+    rows: list[dict],
+    *,
+    previous_rows: list[dict] | None = None,
+) -> list[str]:
     """Форматирует блоки упражнений с нумерацией 1), 2), 3)."""
+    previous_sets_map = (
+        build_previous_sets_map(previous_rows) if previous_rows else None
+    )
     exercises: dict[int, dict] = {}
     for row in rows:
         if row.get("set_number") is None:
@@ -110,9 +136,16 @@ def format_exercise_lines(rows: list[dict]) -> list[str]:
         sets = sorted(ex_data["sets"], key=lambda s: s["set_number"])
         exercise_type = ex_data["exercise_type"]
         lines.append(
-            f"{idx}) {ex_data['name']} — {get_approach_string(len(sets))}"
+            f"{idx}) {ex_data['name']} - {get_approach_string(len(sets))}"
         )
-        lines.append(_format_set_parts(exercise_type, sets))
+        lines.append(
+            _format_set_parts(
+                exercise_type,
+                sets,
+                exercise_name=ex_data["name"],
+                previous_sets_map=previous_sets_map,
+            )
+        )
         lines.append("")
 
     return lines
@@ -133,7 +166,12 @@ def _workout_title_lines(first: dict, selected_date: date | None = None) -> list
     return lines
 
 
-def format_calendar_workout(rows: list[dict], selected_date: date) -> str:
+def format_calendar_workout(
+    rows: list[dict],
+    selected_date: date,
+    *,
+    previous_rows: list[dict] | None = None,
+) -> str:
     """Формат детализации для календаря статистики."""
     first = rows[0]
     started_at = to_local_datetime(first["started_at"])
@@ -144,11 +182,15 @@ def format_calendar_workout(rows: list[dict], selected_date: date) -> str:
         f"Продолжительность: {format_duration(first['started_at'], first.get('finished_at'))}",
         "",
     ]
-    lines.extend(format_exercise_lines(rows))
+    lines.extend(format_exercise_lines(rows, previous_rows=previous_rows))
     return "\n".join(lines).rstrip()
 
 
-def format_finish_workout(rows: list[dict]) -> str:
+def format_finish_workout(
+    rows: list[dict],
+    *,
+    previous_rows: list[dict] | None = None,
+) -> str:
     """Формат отчёта при завершении тренировки."""
     first = rows[0]
     started_at = to_local_datetime(first["started_at"])
@@ -160,5 +202,5 @@ def format_finish_workout(rows: list[dict]) -> str:
         f"Продолжительность: {duration_str}",
         "",
     ]
-    lines.extend(format_exercise_lines(rows))
+    lines.extend(format_exercise_lines(rows, previous_rows=previous_rows))
     return "\n".join(lines).rstrip()
