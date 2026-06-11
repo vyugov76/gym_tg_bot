@@ -31,6 +31,8 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 # Глобальный пул соединений (создаётся при старте бота)
 _pool: aioodbc.Pool | None = None
+_pool_generation = 0
+db_pool_lock = asyncio.Lock()
 
 POOL_MINSIZE = 1
 POOL_MAXSIZE = 10
@@ -114,58 +116,87 @@ async def _close_pool(pool: aioodbc.Pool | None) -> None:
 async def init_db() -> None:
     """Создаёт пул соединений с базой данных (с повторными попытками)."""
     global _pool
-    retries = 5
-    last_error: Exception | None = None
 
-    for attempt in range(1, retries + 1):
-        logger.info("Попытка подключения к БД %s/%s...", attempt, retries)
-        try:
-            _pool = await _create_pool()
-            logger.info("Пул соединений с БД успешно создан!")
-            logger.info(
-                "Параметры пула: driver=%s server=%s database=%s user=%s "
-                "minsize=%s maxsize=%s autocommit=True",
-                DB_DRIVER,
-                DB_SERVER,
-                DB_DATABASE,
-                DB_USER,
-                POOL_MINSIZE,
-                POOL_MAXSIZE,
-            )
-            await apply_schema_migrations()
+    if _pool is not None:
+        return
+
+    async with db_pool_lock:
+        if _pool is not None:
             return
-        except Exception as e:
-            last_error = e
-            logger.warning(
-                "Попытка %s завершилась ошибкой: %s. Повтор через 3 сек...",
-                attempt,
-                e,
-            )
-            if attempt < retries:
-                await asyncio.sleep(3)
 
-    logger.critical("Все попытки подключения к базе данных исчерпаны.")
-    raise last_error
+        retries = 5
+        last_error: Exception | None = None
+
+        for attempt in range(1, retries + 1):
+            logger.info("Попытка подключения к БД %s/%s...", attempt, retries)
+            try:
+                _pool = await _create_pool()
+                logger.info("Пул соединений с БД успешно создан!")
+                logger.info(
+                    "Параметры пула: driver=%s server=%s database=%s user=%s "
+                    "minsize=%s maxsize=%s autocommit=True",
+                    DB_DRIVER,
+                    DB_SERVER,
+                    DB_DATABASE,
+                    DB_USER,
+                    POOL_MINSIZE,
+                    POOL_MAXSIZE,
+                )
+                await apply_schema_migrations()
+                return
+            except Exception as e:
+                last_error = e
+                _pool = None
+                logger.warning(
+                    "Попытка %s завершилась ошибкой: %s. Повтор через 3 сек...",
+                    attempt,
+                    e,
+                )
+                if attempt < retries:
+                    await asyncio.sleep(3)
+
+        logger.critical("Все попытки подключения к базе данных исчерпаны.")
+        raise last_error
 
 
 async def refresh_db_pool() -> None:
     """Пересоздаёт пул после потери соединения (таймаут простоя и т.п.)."""
-    global _pool
-    logger.warning("Пересоздание пула соединений с БД...")
-    old_pool = _pool
-    _pool = None
-    await _close_pool(old_pool)
-    _pool = await _create_pool()
-    logger.info("Пул соединений с БД успешно пересоздан")
+    global _pool, _pool_generation
+
+    generation_before = _pool_generation
+
+    async with db_pool_lock:
+        if _pool_generation != generation_before:
+            logger.info(
+                "Пул уже пересоздан другой задачей (generation %s → %s), пропускаем",
+                generation_before,
+                _pool_generation,
+            )
+            return
+
+        logger.warning("Пересоздание пула соединений с БД...")
+        old_pool = _pool
+        _pool = None
+        await _close_pool(old_pool)
+        _pool = await _create_pool()
+        _pool_generation += 1
+        logger.info(
+            "Пул соединений с БД успешно пересоздан (generation=%s)",
+            _pool_generation,
+        )
 
 
 async def close_db() -> None:
     """Закрывает пул соединений при остановке бота."""
     global _pool
-    if _pool is not None:
-        _pool.close()
-        await _pool.wait_closed()
+
+    async with db_pool_lock:
+        if _pool is None:
+            return
+        pool = _pool
         _pool = None
+        pool.close()
+        await pool.wait_closed()
         logger.info("Пул соединений с БД закрыт")
 
 
