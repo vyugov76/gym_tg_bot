@@ -1,4 +1,19 @@
-"""Точка входа: инициализация бота, БД и запуск polling."""
+"""
+bot - точка входа Telegram-бота для учёта тренировок
+
+Инициализирует логирование, загружает переменные из .env в корне проекта,
+создаёт экземпляр Bot (с опциональным SOCKS5-прокси), подключается к БД
+и запускает long polling через aiogram Dispatcher.
+
+Ключевые функции:
+- setup_logging - настройка файлового и консольного логирования
+- create_bot - создание Bot с прокси или прямым подключением
+- main - регистрация роутеров, init_db и start_polling
+
+Переменные окружения (.env):
+- BOT_TOKEN - токен Telegram-бота (обязательно)
+- PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS - опциональный SOCKS5
+"""
 
 import asyncio
 import logging
@@ -8,20 +23,13 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from dotenv import load_dotenv
-
-# Явно вычисляем путь к .env относительно этого файла bot.py
-env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=env_path)
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp_socks import ProxyConnector
+from dotenv import load_dotenv
 
 from database.connection import close_db, init_db
 from handlers.exercises import router as exercises_router
@@ -31,12 +39,21 @@ from handlers.statistics import router as statistics_router
 from handlers.workout import router as workout_router
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 LOGS_DIR = PROJECT_ROOT / "logs"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 
 def setup_logging() -> logging.Logger:
-    """Настраивает логирование в уникальный файл logs/ и в консоль."""
+    """
+    Настраивает логирование приложения.
+
+    Создаёт каталог logs/, пишет в файл bot_YYYYMMDD_HHMMSS.log и в stdout.
+    Возвращает логгер модуля bot.
+    """
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -68,7 +85,12 @@ logger = setup_logging()
 
 
 def _build_socks5_proxy_url() -> str | None:
-    """SOCKS5 для Telegram API. Пустые PROXY_HOST/PROXY_PORT — прямое подключение."""
+    """
+    Собирает URL SOCKS5-прокси из переменных окружения.
+
+    Читает PROXY_HOST, PROXY_PORT, PROXY_USER и PROXY_PASS.
+    Если host или port не заданы - возвращает None (прямое подключение).
+    """
     host = (os.getenv("PROXY_HOST") or "").strip()
     port = (os.getenv("PROXY_PORT") or "").strip()
     if not host or not port:
@@ -85,7 +107,12 @@ def _build_socks5_proxy_url() -> str | None:
 
 
 def create_bot() -> Bot:
-    """Bot с SOCKS5-сессией для Telegram или стандартный (локальная разработка)."""
+    """
+    Создаёт экземпляр aiogram Bot.
+
+    При наличии настроек прокси подключает AiohttpSession с SOCKS5.
+    Иначе использует стандартную сессию для локальной разработки.
+    """
     bot_kwargs = {
         "token": BOT_TOKEN,
         "default": DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -103,7 +130,13 @@ def create_bot() -> Bot:
 
 
 async def main() -> None:
-    """Запуск бота: подключение к БД, регистрация роутеров, polling."""
+    """
+    Основной цикл работы бота.
+
+    Проверяет BOT_TOKEN, инициализирует Bot и Dispatcher, регистрирует
+    роутеры, подключается к БД и запускает long polling.
+    При завершении закрывает соединение с БД и сессию бота.
+    """
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN не задан. Укажите его в файле .env")
         raise RuntimeError("BOT_TOKEN не задан в переменных окружения")

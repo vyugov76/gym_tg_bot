@@ -1,4 +1,12 @@
-"""Календарь тренировок на базе aiogram-calendar с подсветкой дней."""
+"""
+Назначение: календарь тренировок на базе aiogram-calendar с подсветкой дней.
+
+Ключевые компоненты:
+- WorkoutCalendar - расширение SimpleCalendar с метками дней тренировок
+- _load_workout_days - загрузка дней с тренировками из БД
+- start_calendar - построение inline-календаря с эмодзи
+- _update_calendar - обновление разметки при навигации
+"""
 
 from __future__ import annotations
 
@@ -16,14 +24,42 @@ logger = logging.getLogger(__name__)
 
 
 class WorkoutCalendar(SimpleCalendar):
-    """SimpleCalendar: дни с тренировками помечаются эмодзи 🔥."""
+    """
+    Календарь с подсветкой дней, в которые пользователь тренировался.
+
+    Наследует SimpleCalendar и помечает дни с тренировками эмодзи.
+
+    Атрибуты:
+        user_id: Telegram id пользователя.
+        workout_days: номера дней текущего месяца с записанными тренировками.
+    """
 
     def __init__(self, user_id: int, locale: str | None = None) -> None:
+        """
+        Инициализация календаря для конкретного пользователя.
+
+        Параметры:
+            user_id: Telegram id пользователя.
+            locale: локаль подписей календаря или None для значения по умолчанию.
+
+        Возвращает:
+            None
+        """
         super().__init__(locale=locale)
         self.user_id = user_id
         self.workout_days: set[int] = set()
 
     async def _load_workout_days(self, year: int, month: int) -> None:
+        """
+        Загрузить номера дней месяца с тренировками пользователя.
+
+        Параметры:
+            year: год отображаемого месяца.
+            month: номер месяца (1-12).
+
+        Возвращает:
+            None
+        """
         logger.info(
             "Загрузка дней тренировок: user_id=%s year=%s month=%s",
             self.user_id,
@@ -44,6 +80,16 @@ class WorkoutCalendar(SimpleCalendar):
         year: int = datetime.now().year,
         month: int = datetime.now().month,
     ) -> InlineKeyboardMarkup:
+        """
+        Построить inline-календарь с метками дней тренировок.
+
+        Параметры:
+            year: год отображаемого месяца.
+            month: номер месяца (1-12).
+
+        Возвращает:
+            InlineKeyboardMarkup: сетка календаря с навигацией и кнопками отмены/сегодня.
+        """
         await self._load_workout_days(year, month)
 
         today = datetime.now()
@@ -153,6 +199,16 @@ class WorkoutCalendar(SimpleCalendar):
         return InlineKeyboardMarkup(inline_keyboard=kb)
 
     async def _update_calendar(self, query: CallbackQuery, with_date: datetime) -> None:
+        """
+        Обновить разметку календаря после навигации по месяцам.
+
+        Параметры:
+            query: callback-запрос от inline-кнопки календаря.
+            with_date: дата, определяющая отображаемый год и месяц.
+
+        Возвращает:
+            None
+        """
         await query.message.edit_reply_markup(
             reply_markup=await self.start_calendar(
                 int(with_date.year), int(with_date.month)

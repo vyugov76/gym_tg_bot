@@ -1,4 +1,15 @@
-"""Клавиатуры бота: главное меню, упражнения и тренировки."""
+"""
+Назначение: inline- и reply-клавиатуры бота для меню, настроек и тренировок.
+
+Ключевые компоненты:
+- main_menu_keyboard, settings_menu_keyboard - главное меню и настройки
+- categories_list_keyboard, category_detail_keyboard - управление категориями
+- presets_list_keyboard, preset_detail_keyboard - готовые тренировки
+- workout_start_choice_keyboard, workout_categories_keyboard - сценарий тренировки
+- after_set_keyboard, preset_after_set_keyboard - действия после подхода
+- my_exercises_keyboard, exercise_manage_keyboard - каталог упражнений
+- profile_keyboard - редактирование профиля
+"""
 
 from typing import Any
 
@@ -14,7 +25,12 @@ from utils.preset_helpers import preset_button_text
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Reply-клавиатура главного меню."""
+    """
+    Reply-клавиатура главного меню бота.
+
+    Возвращает:
+        ReplyKeyboardMarkup: кнопки старта тренировки, статистики и настроек.
+    """
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🏋️ Начать тренировку")],
@@ -27,7 +43,12 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 
 def settings_menu_keyboard() -> InlineKeyboardMarkup:
-    """Меню раздела настроек."""
+    """
+    Inline-меню раздела настроек.
+
+    Возвращает:
+        InlineKeyboardMarkup: переходы к упражнениям, шаблонам и профилю.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
@@ -47,7 +68,15 @@ def settings_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def categories_list_keyboard(categories: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    """Список категорий в настройках."""
+    """
+    Список категорий упражнений в настройках.
+
+    Параметры:
+        categories: список категорий с полями id и name.
+
+    Возвращает:
+        InlineKeyboardMarkup: категории, несортированные, создание и возврат.
+    """
     buttons = [
         [InlineKeyboardButton(
             text=f"📂 {cat['name']}",
@@ -71,7 +100,15 @@ def categories_list_keyboard(categories: list[dict[str, Any]]) -> InlineKeyboard
 
 
 def category_detail_keyboard(category_id: int) -> InlineKeyboardMarkup:
-    """Действия внутри категории."""
+    """
+    Действия внутри выбранной категории.
+
+    Параметры:
+        category_id: идентификатор категории.
+
+    Возвращает:
+        InlineKeyboardMarkup: добавление, удаление упражнений и удаление категории.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
@@ -95,7 +132,15 @@ def category_detail_keyboard(category_id: int) -> InlineKeyboardMarkup:
 
 
 def presets_list_keyboard(presets: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    """Список готовых тренировок в настройках."""
+    """
+    Список готовых тренировок в настройках.
+
+    Параметры:
+        presets: список шаблонов с полями id и именем.
+
+    Возвращает:
+        InlineKeyboardMarkup: шаблоны, создание нового и возврат в настройки.
+    """
     buttons = [
         [InlineKeyboardButton(
             text=preset_button_text(preset),
@@ -123,7 +168,16 @@ def template_edit_sets_keyboard(
     preset_id: int,
     exercises: list[dict[str, Any]],
 ) -> InlineKeyboardMarkup:
-    """Выбор упражнения для изменения количества подходов в шаблоне."""
+    """
+    Выбор упражнения для изменения количества подходов в шаблоне.
+
+    Параметры:
+        preset_id: идентификатор шаблона.
+        exercises: упражнения шаблона с полем name.
+
+    Возвращает:
+        InlineKeyboardMarkup: нумерованный список упражнений и кнопка завершения.
+    """
     buttons = [
         [InlineKeyboardButton(
             text=f"{idx}) {ex['name']}",
@@ -139,7 +193,15 @@ def template_edit_sets_keyboard(
 
 
 def preset_detail_keyboard(preset_id: int) -> InlineKeyboardMarkup:
-    """Действия внутри готовой тренировки."""
+    """
+    Действия внутри готовой тренировки.
+
+    Параметры:
+        preset_id: идентификатор шаблона.
+
+    Возвращает:
+        InlineKeyboardMarkup: редактирование состава, подходов и удаление шаблона.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
@@ -167,7 +229,12 @@ def preset_detail_keyboard(preset_id: int) -> InlineKeyboardMarkup:
 
 
 def workout_start_choice_keyboard() -> InlineKeyboardMarkup:
-    """Выбор режима старта тренировки при наличии пресетов."""
+    """
+    Выбор режима старта тренировки при наличии пресетов.
+
+    Возвращает:
+        InlineKeyboardMarkup: пустая тренировка или выбор готовой программы.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
@@ -183,7 +250,15 @@ def workout_start_choice_keyboard() -> InlineKeyboardMarkup:
 
 
 def workout_preset_list_keyboard(presets: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    """Список пресетов для старта тренировки."""
+    """
+    Список пресетов для старта тренировки.
+
+    Параметры:
+        presets: доступные шаблоны с полем id.
+
+    Возвращает:
+        InlineKeyboardMarkup: кнопки шаблонов и возврат к выбору режима.
+    """
     buttons = [
         [InlineKeyboardButton(
             text=preset_button_text(preset),
@@ -199,6 +274,15 @@ def workout_preset_list_keyboard(presets: list[dict[str, Any]]) -> InlineKeyboar
 
 
 def _exercise_icon(exercise: dict[str, Any]) -> str:
+    """
+    Эмодзи-иконка типа упражнения.
+
+    Параметры:
+        exercise: словарь упражнения с exercise_type или is_bodyweight.
+
+    Возвращает:
+        str: символ из EXERCISE_ICONS или значение по умолчанию.
+    """
     exercise_type = normalize_exercise_type(
         exercise.get("exercise_type", exercise.get("is_bodyweight", 0))
     )
@@ -206,7 +290,15 @@ def _exercise_icon(exercise: dict[str, Any]) -> str:
 
 
 def workout_categories_keyboard(categories: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    """Выбор категории при добавлении упражнения в тренировку."""
+    """
+    Выбор категории при добавлении упражнения в тренировку.
+
+    Параметры:
+        categories: список категорий с полями id и name.
+
+    Возвращает:
+        InlineKeyboardMarkup: категории, несортированные, создание и завершение.
+    """
     buttons = [
         [InlineKeyboardButton(
             text=f"📂 {cat['name']}",
@@ -235,7 +327,17 @@ def workout_exercises_keyboard(
     back_callback: str = "wex:back_cats",
     show_finish: bool = True,
 ) -> InlineKeyboardMarkup:
-    """Список упражнений внутри категории для тренировки."""
+    """
+    Список упражнений внутри категории для тренировки.
+
+    Параметры:
+        exercises: упражнения категории с полем name.
+        back_callback: callback_data кнопки возврата к категориям.
+        show_finish: показывать ли кнопку завершения тренировки.
+
+    Возвращает:
+        InlineKeyboardMarkup: упражнения с иконками, создание и навигация.
+    """
     buttons = []
     for idx, ex in enumerate(exercises):
         icon = _exercise_icon(ex)
@@ -265,7 +367,15 @@ def workout_exercises_keyboard(
 
 
 def exercise_category_keyboard(categories: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    """Выбор категории при создании нового упражнения."""
+    """
+    Выбор категории при создании нового упражнения.
+
+    Параметры:
+        categories: список категорий с полями id и name.
+
+    Возвращает:
+        InlineKeyboardMarkup: категории и вариант без категории.
+    """
     buttons = [
         [InlineKeyboardButton(
             text=f"📂 {cat['name']}",
@@ -281,7 +391,12 @@ def exercise_category_keyboard(categories: list[dict[str, Any]]) -> InlineKeyboa
 
 
 def exercise_type_keyboard() -> InlineKeyboardMarkup:
-    """Выбор типа упражнения при создании."""
+    """
+    Выбор типа упражнения при создании.
+
+    Возвращает:
+        InlineKeyboardMarkup: с отягощением, с весом тела или на время.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🏋️‍♂️ С отягощением", callback_data="ex:type:0")],
@@ -292,7 +407,15 @@ def exercise_type_keyboard() -> InlineKeyboardMarkup:
 
 
 def after_set_keyboard(*, show_preset_next: bool = False) -> InlineKeyboardMarkup:
-    """Действия после записи подхода (свободная тренировка без шаблона)."""
+    """
+    Действия после записи подхода в свободной тренировке.
+
+    Параметры:
+        show_preset_next: True - кнопка «Следующее упражнение», иначе «Другое упражнение».
+
+    Возвращает:
+        InlineKeyboardMarkup: исправление, повтор, смена упражнения и завершение.
+    """
     next_ex_text = "➡️ Следующее упражнение" if show_preset_next else "🔄 Другое упражнение"
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -317,7 +440,18 @@ def preset_after_set_keyboard(
     planned_sets: int = 0,
     show_preset_next: bool = True,
 ) -> InlineKeyboardMarkup:
-    """Двухуровневые действия после подхода в тренировке по шаблону."""
+    """
+    Двухуровневые действия после подхода в тренировке по шаблону.
+
+    Параметры:
+        show_extra_menu: показать расширенное меню дополнительных действий.
+        completed_sets: число выполненных подходов текущего упражнения.
+        planned_sets: запланированное число подходов по шаблону.
+        show_preset_next: True - кнопка «Следующее упражнение», иначе «Другое упражнение».
+
+    Возвращает:
+        InlineKeyboardMarkup: компактное или расширенное меню в зависимости от плана.
+    """
     next_ex_text = (
         "➡️ Следующее упражнение"
         if show_preset_next
@@ -367,7 +501,12 @@ def preset_after_set_keyboard(
 
 
 def extra_set_confirm_keyboard() -> InlineKeyboardMarkup:
-    """Подтверждение дополнительного подхода сверх плана шаблона."""
+    """
+    Подтверждение дополнительного подхода сверх плана шаблона.
+
+    Возвращает:
+        InlineKeyboardMarkup: подтверждение или отмена добавления подхода.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -385,7 +524,12 @@ def extra_set_confirm_keyboard() -> InlineKeyboardMarkup:
 
 
 def preset_program_complete_keyboard() -> InlineKeyboardMarkup:
-    """Экран после выполнения всех упражнений программы."""
+    """
+    Экран после выполнения всех упражнений программы.
+
+    Возвращает:
+        InlineKeyboardMarkup: другое упражнение или завершение тренировки.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
@@ -401,7 +545,12 @@ def preset_program_complete_keyboard() -> InlineKeyboardMarkup:
 
 
 def template_save_keyboard() -> InlineKeyboardMarkup:
-    """Выбор действия при завершении изменённой тренировки по шаблону."""
+    """
+    Выбор действия при завершении изменённой тренировки по шаблону.
+
+    Возвращает:
+        InlineKeyboardMarkup: перезапись, сохранение как новый шаблон или пропуск.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
@@ -421,7 +570,15 @@ def template_save_keyboard() -> InlineKeyboardMarkup:
 
 
 def my_exercises_keyboard(exercises: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    """Список упражнений пользователя в категории."""
+    """
+    Список упражнений пользователя в категории.
+
+    Параметры:
+        exercises: упражнения с полями id, name и опционально id_user.
+
+    Возвращает:
+        InlineKeyboardMarkup: упражнения с иконками и меткой глобальных записей.
+    """
     buttons = []
     for ex in exercises:
         icon = _exercise_icon(ex)
@@ -439,7 +596,15 @@ def my_exercises_keyboard(exercises: list[dict[str, Any]]) -> InlineKeyboardMark
 
 
 def exercise_manage_keyboard(exercise: dict[str, Any]) -> InlineKeyboardMarkup:
-    """Меню управления конкретным упражнением."""
+    """
+    Меню управления конкретным упражнением.
+
+    Параметры:
+        exercise: упражнение с полями id, name, exercise_type и id_user.
+
+    Возвращает:
+        InlineKeyboardMarkup: переименование, смена типа и удаление для своих записей.
+    """
     exercise_type = normalize_exercise_type(
         exercise.get("exercise_type", exercise.get("is_bodyweight", 0))
     )
@@ -470,7 +635,12 @@ def exercise_manage_keyboard(exercise: dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 def profile_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки редактирования профиля."""
+    """
+    Кнопки редактирования профиля пользователя.
+
+    Возвращает:
+        InlineKeyboardMarkup: изменение роста, веса и возврат в настройки.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(

@@ -1,4 +1,14 @@
-"""Парсинг ввода подходов для разных типов упражнений."""
+"""
+set_input - парсинг ввода подходов
+
+Регулярные выражения и функции разбора пользовательского ввода для
+упражнений с отягощением, с собственным весом и на время.
+
+Ключевые компоненты:
+- SET_INPUT_PATTERN, REPS_ONLY_PATTERN, TIME_INPUT_PATTERN - шаблоны ввода
+- INVALID_WEIGHTED_MSG, INVALID_REPS_MSG, INVALID_TIME_MSG - сообщения об ошибках
+- parse_weighted_set, parse_bodyweight_reps, parse_time_input - парсеры
+"""
 
 from __future__ import annotations
 
@@ -23,6 +33,16 @@ INVALID_TIME_MSG = (
 
 
 def parse_weighted_set(text: str | None) -> tuple[float, int] | None:
+    """
+    Разбирает ввод подхода с отягощением в формате «вес/повторения».
+
+    Параметры:
+        text: строка вида «80/10» или «80,5/12»
+
+    Возвращает:
+        Кортеж (вес, повторения) или None при ошибке формата или диапазона
+        (вес 0-500, повторения 1-100)
+    """
     if not text:
         return None
     match = SET_INPUT_PATTERN.match(text)
@@ -36,6 +56,15 @@ def parse_weighted_set(text: str | None) -> tuple[float, int] | None:
 
 
 def parse_bodyweight_reps(text: str | None) -> int | None:
+    """
+    Разбирает ввод количества повторений для упражнения с собственным весом.
+
+    Параметры:
+        text: строка с целым числом повторений
+
+    Возвращает:
+        Число повторений (1-100) или None при некорректном вводе
+    """
     if not text:
         return None
     match = REPS_ONLY_PATTERN.match(text)
@@ -48,6 +77,15 @@ def parse_bodyweight_reps(text: str | None) -> int | None:
 
 
 def parse_time_input(text: str | None) -> int | None:
+    """
+    Разбирает ввод длительности упражнения на время.
+
+    Параметры:
+        text: секунды («30») или минуты:секунды («1:30»)
+
+    Возвращает:
+        Общее число секунд (1-7200) или None при некорректном вводе
+    """
     if not text:
         return None
     match = TIME_INPUT_PATTERN.match(text.strip())

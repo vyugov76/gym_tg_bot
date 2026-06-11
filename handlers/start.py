@@ -1,6 +1,14 @@
-"""Обработчик /start и регистрация пользователя."""
+"""
+start - обработчик команды /start
 
-import logging
+Приветствие зарегистрированных пользователей и регистрация новых:
+пошаговый ввод роста и веса.
+
+Ключевые обработчики:
+- cmd_start - команда /start
+- process_height - приём роста при регистрации
+- process_weight - приём веса и завершение регистрации
+"""
 
 from aiogram import Router
 from aiogram.filters import CommandStart
@@ -12,11 +20,20 @@ from keyboards.menu import main_menu_keyboard
 from states.workout_states import RegistrationStates
 
 router = Router(name="start")
-logger = logging.getLogger(__name__)
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
+    """
+    Обрабатывает команду /start.
+
+    Сбрасывает FSM, приветствует существующего пользователя с данными профиля
+    или запускает пошаговую регистрацию для нового.
+
+    Параметры:
+        message: входящее сообщение с командой /start
+        state: контекст FSM для сценария регистрации
+    """
     await state.clear()
     user = await db.get_user_by_telegram_id(message.from_user.id)
 
@@ -39,6 +56,16 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(RegistrationStates.height)
 async def process_height(message: Message, state: FSMContext) -> None:
+    """
+    Принимает рост пользователя на этапе регистрации.
+
+    Проверяет диапазон 100-250 см, сохраняет значение в FSM
+    и переводит к вводу веса.
+
+    Параметры:
+        message: текстовое сообщение с ростом
+        state: контекст FSM с данными регистрации
+    """
     try:
         height = float(message.text.replace(",", "."))
         if not (100 <= height <= 250):
@@ -54,6 +81,16 @@ async def process_height(message: Message, state: FSMContext) -> None:
 
 @router.message(RegistrationStates.weight)
 async def process_weight(message: Message, state: FSMContext) -> None:
+    """
+    Принимает вес, завершает регистрацию и показывает главное меню.
+
+    Проверяет диапазон 30-300 кг, создаёт запись пользователя в БД
+    и сбрасывает FSM.
+
+    Параметры:
+        message: текстовое сообщение с весом
+        state: контекст FSM с сохранённым ростом
+    """
     try:
         weight = float(message.text.replace(",", "."))
         if not (30 <= weight <= 300):

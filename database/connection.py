@@ -1,7 +1,15 @@
-"""Асинхронное подключение к MS SQL Server через ODBC (aioodbc)."""
+"""
+Модуль асинхронного подключения к MS SQL Server.
+
+- Использует aioodbc и ODBC Driver
+- Загружает параметры подключения из .env в корне проекта
+- Управляет глобальным пулом соединений (init, refresh, close)
+- Применяет идемпотентные миграции схемы при старте бота
+"""
 
 from __future__ import annotations
-from pathlib import Path 
+
+from pathlib import Path
 import asyncio
 import logging
 import os
@@ -11,17 +19,8 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-# Находим путь к текущему файлу (connection.py)
-current_path = os.path.abspath(__file__)
-
-# Отсекаем всё, что идет после названия корневой папки проекта
 root_dir = Path(__file__).resolve().parent.parent
-
-# Собираем идеальный абсолютный путь к .env
-env_path = root_dir / ".env"
-
-# Загружаем переменные окружения
-load_dotenv(dotenv_path=env_path)
+load_dotenv(dotenv_path=root_dir / ".env")
 
 DB_DRIVER = os.getenv("DB_DRIVER", "ODBC Driver 17 for SQL Server")
 DB_SERVER = os.getenv("DB_SERVER", "localhost")
@@ -29,7 +28,6 @@ DB_DATABASE = os.getenv("DB_DATABASE", "")
 DB_USER = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
-# Глобальный пул соединений (создаётся при старте бота)
 _pool: aioodbc.Pool | None = None
 _pool_generation = 0
 db_pool_lock = asyncio.Lock()
@@ -37,13 +35,17 @@ db_pool_lock = asyncio.Lock()
 POOL_MINSIZE = 1
 POOL_MAXSIZE = 10
 
-# Таймауты ODBC: не ждать ответа от «мёртвого» сокета ~20 сек
 ODBC_CONNECTION_TIMEOUT = 5
 ODBC_QUERY_TIMEOUT = 5
 
 
 def build_dsn() -> str:
-    """Формирует строку подключения ODBC с авторизацией по логину и паролю."""
+    """
+    Формирует строку подключения ODBC с авторизацией по логину и паролю.
+
+    Возвращает:
+        Строка DSN для aioodbc.create_pool.
+    """
     return (
         f"DRIVER={{{DB_DRIVER}}};"
         f"SERVER={DB_SERVER};"
@@ -57,7 +59,12 @@ def build_dsn() -> str:
 
 
 async def _create_pool() -> aioodbc.Pool:
-    """Создаёт новый пул соединений."""
+    """
+    Создаёт новый пул соединений с текущими параметрами DSN.
+
+    Возвращает:
+        Экземпляр aioodbc.Pool с autocommit=True.
+    """
     return await aioodbc.create_pool(
         dsn=build_dsn(),
         minsize=POOL_MINSIZE,
@@ -87,7 +94,14 @@ _SCHEMA_MIGRATIONS: tuple[str, ...] = (
 
 
 async def apply_schema_migrations() -> None:
-    """Применяет идемпотентные миграции схемы (вызывается при старте бота)."""
+    """
+    Применяет идемпотентные миграции схемы БД.
+
+    Вызывается при успешном init_db(). При ошибке логирует исключение и пробрасывает его.
+
+    Возвращает:
+        None.
+    """
     pool = get_pool()
     conn = await pool.acquire()
     try:
@@ -103,7 +117,15 @@ async def apply_schema_migrations() -> None:
 
 
 async def _close_pool(pool: aioodbc.Pool | None) -> None:
-    """Безопасно закрывает пул."""
+    """
+    Безопасно закрывает пул соединений.
+
+    Параметры:
+        pool: Пул для закрытия или None (ничего не делает).
+
+    Возвращает:
+        None.
+    """
     if pool is None:
         return
     try:
@@ -114,7 +136,15 @@ async def _close_pool(pool: aioodbc.Pool | None) -> None:
 
 
 async def init_db() -> None:
-    """Создаёт пул соединений с базой данных (с повторными попытками)."""
+    """
+    Создаёт пул соединений с базой данных с повторными попытками.
+
+    До 5 попыток с паузой 3 секунды. После успеха применяет миграции схемы.
+    Повторный вызов безопасен - пул создаётся только один раз.
+
+    Возвращает:
+        None.
+    """
     global _pool
 
     if _pool is not None:
@@ -160,7 +190,14 @@ async def init_db() -> None:
 
 
 async def refresh_db_pool() -> None:
-    """Пересоздаёт пул после потери соединения (таймаут простоя и т.п.)."""
+    """
+    Пересоздаёт пул после потери соединения (таймаут простоя и т.п.).
+
+    Использует счётчик generation, чтобы параллельные задачи не пересоздавали пул дважды.
+
+    Возвращает:
+        None.
+    """
     global _pool, _pool_generation
 
     generation_before = _pool_generation
@@ -168,7 +205,7 @@ async def refresh_db_pool() -> None:
     async with db_pool_lock:
         if _pool_generation != generation_before:
             logger.info(
-                "Пул уже пересоздан другой задачей (generation %s → %s), пропускаем",
+                "Пул уже пересоздан другой задачей (generation %s -> %s), пропускаем",
                 generation_before,
                 _pool_generation,
             )
@@ -187,7 +224,14 @@ async def refresh_db_pool() -> None:
 
 
 async def close_db() -> None:
-    """Закрывает пул соединений при остановке бота."""
+    """
+    Закрывает пул соединений при остановке бота.
+
+    Безопасен при повторном вызове или если пул не был инициализирован.
+
+    Возвращает:
+        None.
+    """
     global _pool
 
     async with db_pool_lock:
@@ -201,7 +245,15 @@ async def close_db() -> None:
 
 
 def get_pool() -> aioodbc.Pool:
-    """Возвращает активный пул. Вызывать только после init_db()."""
+    """
+    Возвращает активный пул соединений.
+
+    Возвращает:
+        Текущий aioodbc.Pool.
+
+    Исключения:
+        RuntimeError: Если init_db() ещё не вызывался.
+    """
     if _pool is None:
         raise RuntimeError("Пул БД не инициализирован. Вызовите init_db() перед работой.")
     return _pool
@@ -210,7 +262,14 @@ def get_pool() -> aioodbc.Pool:
 async def discard_connection(conn) -> None:
     """
     Закрывает протухшее соединение, не возвращая его в пул.
+
     Вызывать при OperationalError / ProgrammingError об обрыве связи.
+
+    Параметры:
+        conn: Соединение aioodbc, которое нужно уничтожить.
+
+    Возвращает:
+        None.
     """
     try:
         await conn.close()

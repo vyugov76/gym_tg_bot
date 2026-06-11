@@ -1,4 +1,12 @@
-"""Запросы к базе данных: пользователи, упражнения, тренировки, подходы."""
+"""
+Модуль SQL-запросов к базе данных бота.
+
+- Пользователи, категории, каталог упражнений
+- Шаблоны тренировок (пресеты)
+- Активные и завершённые тренировки, подходы
+- Статистика и in-memory кэш каталога упражнений
+- Повторы запросов при обрыве соединения и обновление пула
+"""
 
 from __future__ import annotations
 
@@ -20,7 +28,6 @@ RETRY_DELAY_SEC = 0.5
 
 _CONNECTION_ERROR_CODES = frozenset({"08S01", "HYT00", "HYT01", "01000"})
 
-# In-memory cache: admin catalog (id_user IS NULL) changes rarely.
 USER_CACHE_TTL_SECONDS = 7200
 
 _admin_exercises_cache: list[dict[str, Any]] | None = None
@@ -28,10 +35,26 @@ _user_exercises_cache: dict[int, dict[str, Any]] = {}
 
 
 def _cache_monotonic_time() -> float:
+    """
+    Возвращает монотонное время для TTL кэша.
+
+    Возвращает:
+        Текущее monotonic-время event loop в секундах.
+    """
     return asyncio.get_event_loop().time()
 
 
 def _store_user_exercises_cache(user_id: int, exercises: list[dict[str, Any]]) -> None:
+    """
+    Сохраняет каталог упражнений пользователя в in-memory кэш.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        exercises: Нормализованный список упражнений каталога.
+
+    Возвращает:
+        None.
+    """
     _user_exercises_cache[user_id] = {
         "data": exercises,
         "expires_at": _cache_monotonic_time() + USER_CACHE_TTL_SECONDS,
@@ -39,6 +62,15 @@ def _store_user_exercises_cache(user_id: int, exercises: list[dict[str, Any]]) -
 
 
 def _get_valid_user_exercises_cache(user_id: int) -> list[dict[str, Any]] | None:
+    """
+    Возвращает кэш каталога пользователя, если он ещё не истёк.
+
+    Параметры:
+        user_id: Внутренний id_user.
+
+    Возвращает:
+        Список упражнений или None, если кэш отсутствует или просрочен.
+    """
     entry = _user_exercises_cache.get(user_id)
     if entry is None:
         return None
@@ -49,6 +81,15 @@ def _get_valid_user_exercises_cache(user_id: int) -> list[dict[str, Any]] | None
 
 
 async def _fetch_one_dict(cur) -> dict[str, Any] | None:
+    """
+    Читает одну строку курсора и преобразует её в словарь.
+
+    Параметры:
+        cur: Асинхронный курсор aioodbc.
+
+    Возвращает:
+        Словарь column_name -> value или None, если строк нет.
+    """
     row = await cur.fetchone()
     if row is None:
         return None
@@ -57,17 +98,43 @@ async def _fetch_one_dict(cur) -> dict[str, Any] | None:
 
 
 async def _fetch_all_dicts(cur) -> list[dict[str, Any]]:
+    """
+    Читает все строки курсора и преобразует их в список словарей.
+
+    Параметры:
+        cur: Асинхронный курсор aioodbc.
+
+    Возвращает:
+        Список словарей column_name -> value.
+    """
     rows = await cur.fetchall()
     columns = [col[0] for col in cur.description]
     return [dict(zip(columns, row, strict=False)) for row in rows]
 
 
 def _error_text(exc: BaseException) -> str:
+    """
+    Возвращает текст исключения в нижнем регистре для сравнения.
+
+    Параметры:
+        exc: Исключение.
+
+    Возвращает:
+        str(exc).lower().
+    """
     return str(exc).lower()
 
 
 def _is_dead_connection_error(exc: BaseException) -> bool:
-    """Обрыв TCP / протухшее соединение из пула (10054, 08S01, closed connection)."""
+    """
+    Определяет, связана ли ошибка с обрывом TCP или протухшим соединением из пула.
+
+    Параметры:
+        exc: Исключение из execute/fetch.
+
+    Возвращает:
+        True, если соединение считается нерабочим (10054, 08S01, closed connection и т.п.).
+    """
     if isinstance(exc, (pyodbc.OperationalError, pyodbc.InterfaceError)):
         return True
 
@@ -98,6 +165,16 @@ def _is_dead_connection_error(exc: BaseException) -> bool:
 
 
 async def _read_fetch_result(cur, fetch: FetchMode) -> Any:
+    """
+    Читает результат запроса в формате, заданном параметром fetch.
+
+    Параметры:
+        cur: Асинхронный курсор после execute.
+        fetch: Режим чтения: one, all, scalar или none.
+
+    Возвращает:
+        dict, list[dict], скалярное значение или None в зависимости от fetch.
+    """
     if fetch == "one":
         return await _fetch_one_dict(cur)
     if fetch == "all":
@@ -110,7 +187,12 @@ async def _read_fetch_result(cur, fetch: FetchMode) -> Any:
 
 @asynccontextmanager
 async def _pooled_connection() -> AsyncIterator[Any]:
-    """Асинхронный контекст: соединение из пула с release или discard при обрыве."""
+    """
+    Асинхронный контекст: соединение из пула с release или discard при обрыве.
+
+    Возвращает:
+        Асинхронный итератор, отдающий соединение aioodbc из пула.
+    """
     pool = get_pool()
     conn = await pool.acquire()
     discard = False
@@ -135,7 +217,17 @@ async def _execute_query(
     params: tuple,
     fetch: FetchMode,
 ) -> Any:
-    """Одна попытка: acquire → execute → release (или discard при обрыве)."""
+    """
+    Выполняет один SQL-запрос: acquire -> execute -> release (или discard при обрыве).
+
+    Параметры:
+        sql: Текст SQL-запроса с плейсхолдерами ?.
+        params: Кортеж параметров для подстановки.
+        fetch: Режим чтения результата.
+
+    Возвращает:
+        Результат _read_fetch_result или None для fetch=none.
+    """
     async with _pooled_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql, params)
@@ -147,7 +239,20 @@ async def _run_query(
     params: tuple = (),
     fetch: FetchMode = "none",
 ) -> Any:
-    """Выполняет SQL с повторами при обрыве соединения (до 3 попыток)."""
+    """
+    Выполняет SQL с повторами при обрыве соединения (до MAX_QUERY_ATTEMPTS попыток).
+
+    Параметры:
+        sql: Текст SQL-запроса.
+        params: Параметры запроса, по умолчанию пустой кортеж.
+        fetch: Режим чтения результата, по умолчанию none.
+
+    Возвращает:
+        Результат запроса или None для fetch=none.
+
+    Исключения:
+        Exception: Любая не связанная с обрывом ошибка или исчерпание попыток.
+    """
     last_error: BaseException | None = None
 
     for attempt in range(1, MAX_QUERY_ATTEMPTS + 1):
@@ -192,11 +297,28 @@ async def _run_query(
 
 
 def _as_exercise_type(value: Any) -> int:
-    """Тип упражнения: 0 — с весом, 1 — своий вес, 2 — на время."""
+    """
+    Приводит значение is_bodyweight к целочисленному типу упражнения.
+
+    Параметры:
+        value: Значение из БД или None.
+
+    Возвращает:
+        0 - с весом, 1 - свой вес, 2 - на время; None трактуется как 0.
+    """
     return int(value) if value is not None else 0
 
 
 def _normalize_exercise_row(row: dict[str, Any]) -> dict[str, Any]:
+    """
+    Добавляет поле exercise_type и нормализует is_bodyweight в строке упражнения.
+
+    Параметры:
+        row: Строка результата запроса (изменяется in-place).
+
+    Возвращает:
+        Тот же словарь row с заполненным exercise_type.
+    """
     row["is_bodyweight"] = _as_exercise_type(row["is_bodyweight"])
     row["exercise_type"] = row["is_bodyweight"]
     return row
@@ -242,7 +364,15 @@ _CATALOG_SELECT = """
 
 
 def clear_exercise_cache(user_id: int | None = None) -> None:
-    """Сбрасывает кэш каталога упражнений (всех или для одного пользователя)."""
+    """
+    Сбрасывает кэш каталога упражнений.
+
+    Параметры:
+        user_id: Если None - сбрасывает весь кэш; иначе только для одного пользователя.
+
+    Возвращает:
+        None.
+    """
     global _admin_exercises_cache
     if user_id is None:
         _admin_exercises_cache = None
@@ -252,11 +382,28 @@ def clear_exercise_cache(user_id: int | None = None) -> None:
 
 
 def _invalidate_exercise_cache(user_id: int | None = None) -> None:
+    """
+    Обёртка над clear_exercise_cache для вызова после изменений каталога.
+
+    Параметры:
+        user_id: Пользователь, чей кэш нужно сбросить, или None для полного сброса.
+
+    Возвращает:
+        None.
+    """
     clear_exercise_cache(user_id)
 
 
 async def _fetch_admin_exercises(*, refresh: bool = False) -> list[dict[str, Any]]:
-    """Админский каталог (id_user IS NULL), с in-memory кэшем."""
+    """
+    Загружает админский каталог упражнений (id_user IS NULL) с in-memory кэшем.
+
+    Параметры:
+        refresh: Принудительно перечитать данные из БД, игнорируя кэш.
+
+    Возвращает:
+        Список нормализованных упражнений админского каталога.
+    """
     global _admin_exercises_cache
     if not refresh and _admin_exercises_cache is not None:
         return _admin_exercises_cache
@@ -280,7 +427,16 @@ async def _fetch_user_catalog_exercises(
     *,
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    """Личные упражнения пользователя в каталоге, с кэшем на user_id."""
+    """
+    Загружает личные упражнения пользователя в каталоге с кэшем на user_id.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        refresh: Принудительно перечитать данные из БД.
+
+    Возвращает:
+        Список нормализованных упражнений пользователя.
+    """
     if not refresh:
         cached = _get_valid_user_exercises_cache(user_id)
         if cached is not None:
@@ -307,6 +463,17 @@ async def _fetch_workout_detail_rows(
     params: tuple,
     order_by: str,
 ) -> list[dict[str, Any]]:
+    """
+    Выполняет детальный SELECT тренировки с подходами и нормализует типы упражнений.
+
+    Параметры:
+        where_clause: Фрагмент SQL после WHERE (без ключевого слова WHERE).
+        params: Параметры для where_clause.
+        order_by: Выражение ORDER BY (без ключевого слова ORDER BY).
+
+    Возвращает:
+        Список строк с полями тренировки, упражнения и подхода.
+    """
     rows = await _run_query(
         f"""
         {_WORKOUT_DETAIL_SELECT}
@@ -319,10 +486,35 @@ async def _fetch_workout_detail_rows(
     return _normalize_workout_detail_rows(rows)
 
 
+def _normalize_workout_detail_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Нормализует is_bodyweight и добавляет exercise_type в строках детализации тренировки.
+
+    Параметры:
+        rows: Список строк результата JOIN (изменяется in-place).
+
+    Возвращает:
+        Тот же список rows с заполненным exercise_type.
+    """
+    for row in rows:
+        row["is_bodyweight"] = _as_exercise_type(row["is_bodyweight"])
+        row["exercise_type"] = row["is_bodyweight"]
+    return rows
+
+
 # --- Пользователи ---
 
 
 async def get_user_by_telegram_id(telegram_id: int) -> dict[str, Any] | None:
+    """
+    Находит пользователя по Telegram ID.
+
+    Параметры:
+        telegram_id: ID пользователя в Telegram.
+
+    Возвращает:
+        Словарь с полями id, telegram_id, height, weight, created_at или None.
+    """
     return await _run_query(
         """
         SELECT id_user AS id, telegram_id, height, weight, created_at
@@ -335,6 +527,16 @@ async def get_user_by_telegram_id(telegram_id: int) -> dict[str, Any] | None:
 
 
 async def update_user_height(user_id: int, height: float) -> None:
+    """
+    Обновляет рост пользователя.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        height: Новое значение роста.
+
+    Возвращает:
+        None.
+    """
     await _run_query(
         """
         UPDATE GTB_users
@@ -346,6 +548,16 @@ async def update_user_height(user_id: int, height: float) -> None:
 
 
 async def update_user_weight(user_id: int, weight: float) -> None:
+    """
+    Обновляет вес пользователя.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        weight: Новое значение веса.
+
+    Возвращает:
+        None.
+    """
     await _run_query(
         """
         UPDATE GTB_users
@@ -357,6 +569,17 @@ async def update_user_weight(user_id: int, weight: float) -> None:
 
 
 async def add_user(telegram_id: int, height: float, weight: float) -> int:
+    """
+    Создаёт нового пользователя.
+
+    Параметры:
+        telegram_id: ID пользователя в Telegram.
+        height: Рост при регистрации.
+        weight: Вес при регистрации.
+
+    Возвращает:
+        id_user созданной записи.
+    """
     user_id = await _run_query(
         """
         INSERT INTO GTB_users (telegram_id, height, weight)
@@ -373,6 +596,15 @@ async def add_user(telegram_id: int, height: float, weight: float) -> int:
 
 
 async def get_categories_by_user_id(user_id: int) -> list[dict[str, Any]]:
+    """
+    Возвращает категории упражнений пользователя.
+
+    Параметры:
+        user_id: Внутренний id_user.
+
+    Возвращает:
+        Список словарей с полями id и name, отсортированный по имени.
+    """
     return await _run_query(
         """
         SELECT id_category AS id, category_name AS name
@@ -386,6 +618,15 @@ async def get_categories_by_user_id(user_id: int) -> list[dict[str, Any]]:
 
 
 async def get_category_by_id(category_id: int) -> dict[str, Any] | None:
+    """
+    Возвращает категорию по id.
+
+    Параметры:
+        category_id: id_category.
+
+    Возвращает:
+        Словарь с полями id, id_user, name или None.
+    """
     return await _run_query(
         """
         SELECT id_category AS id, id_user, category_name AS name
@@ -398,6 +639,16 @@ async def get_category_by_id(category_id: int) -> dict[str, Any] | None:
 
 
 async def add_category(user_id: int, category_name: str) -> int:
+    """
+    Создаёт категорию упражнений для пользователя.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        category_name: Название категории.
+
+    Возвращает:
+        id_category новой записи.
+    """
     category_id = await _run_query(
         """
         INSERT INTO GTB_categories (id_user, category_name)
@@ -415,7 +666,17 @@ async def bulk_assign_exercises_to_category(
     category_id: int,
     id_user: int,
 ) -> int:
-    """Назначает несортированные упражнения в категорию. Возвращает число обновлённых строк."""
+    """
+    Назначает несортированные упражнения в категорию.
+
+    Параметры:
+        exercise_ids: Список id_workout_exercise для обновления.
+        category_id: Целевая категория.
+        id_user: Владелец упражнений.
+
+    Возвращает:
+        Число переданных ID (0, если список пуст).
+    """
     if not exercise_ids:
         return 0
     placeholders = ",".join("?" * len(exercise_ids))
@@ -440,7 +701,17 @@ async def bulk_unassign_exercises_from_category(
     category_id: int,
     id_user: int,
 ) -> int:
-    """Сбрасывает category_id в NULL для упражнений категории."""
+    """
+    Сбрасывает category_id в NULL для упражнений указанной категории.
+
+    Параметры:
+        exercise_ids: Список id_workout_exercise.
+        category_id: Категория, из которой снимаются упражнения.
+        id_user: Владелец упражнений.
+
+    Возвращает:
+        Число переданных ID (0, если список пуст).
+    """
     if not exercise_ids:
         return 0
     placeholders = ",".join("?" * len(exercise_ids))
@@ -461,7 +732,18 @@ async def bulk_unassign_exercises_from_category(
 
 
 async def delete_category(category_id: int, user_id: int) -> None:
-    """Удаляет категорию. Упражнения получают category_id = NULL (ON DELETE SET NULL)."""
+    """
+    Удаляет категорию пользователя.
+
+    Упражнения получают category_id = NULL (ON DELETE SET NULL).
+
+    Параметры:
+        category_id: id_category.
+        user_id: Внутренний id_user владельца.
+
+    Возвращает:
+        None.
+    """
     await _run_query(
         """
         DELETE FROM GTB_categories
@@ -480,8 +762,14 @@ async def get_global_exercises_by_user_id(
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
     """
-    Полный каталог: админские (кэш) + личные упражнения пользователя (кэш на user_id).
-    Параметр refresh=True принудительно перечитывает данные из БД.
+    Возвращает полный каталог: админские и личные упражнения пользователя.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        refresh: Принудительно перечитать данные из БД, минуя кэш.
+
+    Возвращает:
+        Объединённый отсортированный список упражнений каталога.
     """
     admin = await _fetch_admin_exercises(refresh=refresh)
     user_rows = await _fetch_user_catalog_exercises(user_id, refresh=refresh)
@@ -496,8 +784,18 @@ async def get_exercises_by_category(
     *,
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    """Упражнения категории: фильтрация на стороне СУБД."""
-    del refresh  # точечный запрос всегда читает актуальные данные из БД
+    """
+    Возвращает упражнения указанной категории (фильтрация на стороне СУБД).
+
+    Параметры:
+        user_id: Внутренний id_user.
+        category_id: id_category.
+        refresh: Не используется; запрос всегда читает актуальные данные из БД.
+
+    Возвращает:
+        Список упражнений категории (админские и пользовательские).
+    """
+    del refresh
     rows = await _run_query(
         f"""
         {_CATALOG_SELECT}
@@ -518,7 +816,16 @@ async def get_unsorted_exercises(
     *,
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    """Несортированные упражнения: category_id IS NULL в SQL."""
+    """
+    Возвращает несортированные упражнения (category_id IS NULL).
+
+    Параметры:
+        user_id: Внутренний id_user.
+        refresh: Не используется; запрос всегда читает актуальные данные из БД.
+
+    Возвращает:
+        Список упражнений без категории.
+    """
     del refresh
     rows = await _run_query(
         f"""
@@ -536,6 +843,15 @@ async def get_unsorted_exercises(
 
 
 async def get_exercise_by_id(exercise_id: int) -> dict[str, Any] | None:
+    """
+    Возвращает упражнение по id_workout_exercise.
+
+    Параметры:
+        exercise_id: id_workout_exercise.
+
+    Возвращает:
+        Нормализованный словарь упражнения или None, если не найдено.
+    """
     row = await _run_query(
         """
         SELECT
@@ -562,6 +878,18 @@ async def add_global_exercise(
     exercise_type: int,
     category_id: int | None = None,
 ) -> int:
+    """
+    Добавляет упражнение в глобальный каталог пользователя.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        exercise_name: Название упражнения.
+        exercise_type: Тип: 0 - с весом, 1 - свой вес, 2 - на время.
+        category_id: id_category или None для несортированных.
+
+    Возвращает:
+        id_workout_exercise новой записи.
+    """
     exercise_id = await _run_query(
         """
         INSERT INTO GTB_workout_exercises
@@ -577,6 +905,16 @@ async def add_global_exercise(
 
 
 async def update_exercise_name(exercise_id: int, new_name: str) -> None:
+    """
+    Переименовывает упражнение в глобальном каталоге.
+
+    Параметры:
+        exercise_id: id_workout_exercise.
+        new_name: Новое название.
+
+    Возвращает:
+        None.
+    """
     exercise = await get_exercise_by_id(exercise_id)
     await _run_query(
         """
@@ -592,7 +930,16 @@ async def update_exercise_name(exercise_id: int, new_name: str) -> None:
 
 
 async def soft_delete_global_exercise(exercise_id: int, id_user: int) -> bool:
-    """Мягкое удаление упражнения из каталога пользователя."""
+    """
+    Мягко удаляет упражнение из каталога пользователя (is_deleted = 1).
+
+    Параметры:
+        exercise_id: id_workout_exercise.
+        id_user: Владелец упражнения.
+
+    Возвращает:
+        True после выполнения UPDATE.
+    """
     await _run_query(
         """
         UPDATE GTB_workout_exercises
@@ -609,7 +956,15 @@ async def soft_delete_global_exercise(exercise_id: int, id_user: int) -> bool:
 
 
 async def cycle_exercise_type(exercise_id: int) -> int:
-    """Переключает тип глобального упражнения по циклу 0 → 1 → 2 → 0."""
+    """
+    Переключает тип глобального упражнения по циклу 0 -> 1 -> 2 -> 0.
+
+    Параметры:
+        exercise_id: id_workout_exercise.
+
+    Возвращает:
+        Новое значение типа или 0, если упражнение не найдено.
+    """
     exercise = await get_exercise_by_id(exercise_id)
     if not exercise:
         return 0
@@ -629,8 +984,16 @@ async def cycle_exercise_type(exercise_id: int) -> int:
     return new_value
 
 
-# Обратная совместимость: старое имя функции
 async def get_exercises_by_user_id(user_id: int) -> list[dict[str, Any]]:
+    """
+    Обратная совместимость: алиас get_global_exercises_by_user_id.
+
+    Параметры:
+        user_id: Внутренний id_user.
+
+    Возвращает:
+        Полный каталог упражнений пользователя.
+    """
     return await get_global_exercises_by_user_id(user_id)
 
 
@@ -638,6 +1001,15 @@ async def get_exercises_by_user_id(user_id: int) -> list[dict[str, Any]]:
 
 
 async def get_presets_by_user_id(user_id: int) -> list[dict[str, Any]]:
+    """
+    Возвращает шаблоны тренировок пользователя.
+
+    Параметры:
+        user_id: Внутренний id_user.
+
+    Возвращает:
+        Список словарей с полями id и name.
+    """
     return await _run_query(
         """
         SELECT id_preset AS id, preset_name AS name, preset_name
@@ -651,6 +1023,15 @@ async def get_presets_by_user_id(user_id: int) -> list[dict[str, Any]]:
 
 
 async def get_preset_by_id(preset_id: int) -> dict[str, Any] | None:
+    """
+    Возвращает шаблон тренировки по id.
+
+    Параметры:
+        preset_id: id_preset.
+
+    Возвращает:
+        Словарь с полями id, id_user, name или None.
+    """
     return await _run_query(
         """
         SELECT id_preset AS id, id_user, preset_name AS name, preset_name
@@ -663,6 +1044,15 @@ async def get_preset_by_id(preset_id: int) -> dict[str, Any] | None:
 
 
 async def get_preset_exercises(preset_id: int) -> list[dict[str, Any]]:
+    """
+    Возвращает упражнения шаблона в порядке sequence_number.
+
+    Параметры:
+        preset_id: id_preset.
+
+    Возвращает:
+        Список нормализованных упражнений шаблона.
+    """
     rows = await _run_query(
         """
         SELECT
@@ -682,6 +1072,16 @@ async def get_preset_exercises(preset_id: int) -> list[dict[str, Any]]:
 
 
 async def create_preset(user_id: int, preset_name: str) -> int:
+    """
+    Создаёт пустой шаблон тренировки.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        preset_name: Название шаблона.
+
+    Возвращает:
+        id_preset новой записи.
+    """
     preset_id = await _run_query(
         """
         INSERT INTO GTB_preset_workouts (id_user, preset_name, is_deleted)
@@ -695,7 +1095,15 @@ async def create_preset(user_id: int, preset_name: str) -> int:
 
 
 async def get_max_preset_sequence_number(preset_id: int) -> int:
-    """Максимальный sequence_number в шаблоне (0 если пусто)."""
+    """
+    Возвращает максимальный sequence_number в шаблоне.
+
+    Параметры:
+        preset_id: id_preset.
+
+    Возвращает:
+        Максимальный порядковый номер или 0, если шаблон пуст.
+    """
     value = await _run_query(
         """
         SELECT ISNULL(MAX(sequence_number), 0)
@@ -713,7 +1121,17 @@ async def bulk_add_global_exercises_to_preset(
     global_exercise_ids: list[int],
     id_user: int,
 ) -> int:
-    """Добавляет глобальные упражнения в шаблон. Возвращает число добавленных."""
+    """
+    Добавляет глобальные упражнения в шаблон тренировки.
+
+    Параметры:
+        preset_id: id_preset.
+        global_exercise_ids: Список id упражнений каталога.
+        id_user: Владелец шаблона и упражнений.
+
+    Возвращает:
+        Число фактически добавленных упражнений.
+    """
     if not global_exercise_ids:
         return 0
 
@@ -747,7 +1165,17 @@ async def bulk_delete_preset_exercises(
     preset_id: int,
     id_user: int,
 ) -> int:
-    """Удаляет упражнения из шаблона. Возвращает число переданных ID."""
+    """
+    Удаляет упражнения из шаблона по списку id.
+
+    Параметры:
+        preset_exercise_ids: Список id_preset_exercise.
+        preset_id: id_preset.
+        id_user: Владелец шаблона.
+
+    Возвращает:
+        Число переданных ID (0, если список пуст или нет доступа).
+    """
     if not preset_exercise_ids:
         return 0
 
@@ -774,6 +1202,19 @@ async def add_preset_exercise(
     sequence_number: int,
     sets_count: int = 0,
 ) -> int:
+    """
+    Добавляет упражнение в шаблон тренировки.
+
+    Параметры:
+        preset_id: id_preset.
+        exercise_name: Название упражнения.
+        exercise_type: Тип упражнения (0, 1 или 2).
+        sequence_number: Порядок в шаблоне.
+        sets_count: Планируемое число подходов, по умолчанию 0.
+
+    Возвращает:
+        id_preset_exercise новой записи.
+    """
     preset_exercise_id = await _run_query(
         """
         INSERT INTO GTB_preset_exercises
@@ -792,6 +1233,17 @@ async def update_preset_exercise_sets_count(
     preset_id: int,
     sets_count: int,
 ) -> None:
+    """
+    Обновляет планируемое число подходов упражнения в шаблоне.
+
+    Параметры:
+        preset_exercise_id: id_preset_exercise.
+        preset_id: id_preset (проверка принадлежности).
+        sets_count: Новое значение sets_count.
+
+    Возвращает:
+        None.
+    """
     await _run_query(
         """
         UPDATE GTB_preset_exercises
@@ -803,7 +1255,18 @@ async def update_preset_exercise_sets_count(
 
 
 async def delete_preset(preset_id: int, user_id: int) -> None:
-    """Мягкое удаление шаблона. Исторические GTB_workouts не затрагиваются."""
+    """
+    Мягко удаляет шаблон тренировки (is_deleted = 1).
+
+    Исторические GTB_workouts не затрагиваются.
+
+    Параметры:
+        preset_id: id_preset.
+        user_id: Внутренний id_user владельца.
+
+    Возвращает:
+        None.
+    """
     await _run_query(
         """
         UPDATE GTB_preset_workouts
@@ -817,7 +1280,15 @@ async def delete_preset(preset_id: int, user_id: int) -> None:
 async def get_unique_workout_exercises_ordered(
     workout_id: int,
 ) -> list[dict[str, Any]]:
-    """Уникальные упражнения тренировки в порядке первого появления."""
+    """
+    Возвращает уникальные упражнения тренировки в порядке первого появления.
+
+    Параметры:
+        workout_id: id_workout.
+
+    Возвращает:
+        Список упражнений с полями name, is_bodyweight, first_id.
+    """
     rows = await _run_query(
         """
         SELECT
@@ -840,6 +1311,17 @@ async def create_preset_from_workout(
     preset_name: str,
     workout_id: int,
 ) -> int:
+    """
+    Создаёт шаблон из завершённой тренировки.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        preset_name: Название нового шаблона.
+        workout_id: id_workout-источника.
+
+    Возвращает:
+        id_preset созданного шаблона.
+    """
     preset_id = await create_preset(user_id, preset_name)
     await copy_workout_exercises_to_preset(preset_id, workout_id)
     return preset_id
@@ -848,7 +1330,17 @@ async def create_preset_from_workout(
 async def get_workout_exercises_with_set_counts(
     workout_id: int,
 ) -> list[dict[str, Any]]:
-    """Упражнения тренировки с фактическим числом подходов (порядок первого появления)."""
+    """
+    Возвращает упражнения тренировки с фактическим числом подходов.
+
+    Порядок - по первому появлению упражнения в сессии.
+
+    Параметры:
+        workout_id: id_workout.
+
+    Возвращает:
+        Список упражнений с полем performed_sets.
+    """
     rows = await _run_query(
         """
         SELECT
@@ -878,7 +1370,16 @@ async def copy_workout_exercises_to_preset(
     preset_id: int,
     workout_id: int,
 ) -> int:
-    """Копирует упражнения тренировки в шаблон (порядок первого появления)."""
+    """
+    Копирует упражнения тренировки в шаблон (порядок первого появления).
+
+    Параметры:
+        preset_id: id_preset.
+        workout_id: id_workout-источника.
+
+    Возвращает:
+        Число скопированных упражнений.
+    """
     exercises = await get_workout_exercises_with_set_counts(workout_id)
     for seq, exercise in enumerate(exercises, start=1):
         await add_preset_exercise(
@@ -897,7 +1398,17 @@ async def get_previous_finished_workout_id(
     *,
     exclude_workout_id: int | None = None,
 ) -> int | None:
-    """Последняя завершённая тренировка по тому же шаблону (кроме exclude)."""
+    """
+    Возвращает id последней завершённой тренировки по тому же шаблону.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        preset_id: id_preset.
+        exclude_workout_id: id_workout, который нужно исключить из поиска.
+
+    Возвращает:
+        id_workout или None, если предыдущих сессий нет.
+    """
     if exclude_workout_id is not None:
         workout_id = await _run_query(
             """
@@ -935,8 +1446,15 @@ async def get_previous_workout_detail_for_preset(
     exclude_workout_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Детали последней завершённой тренировки по шаблону — один SQL-запрос.
-    Пустой список, если предыдущих сессий нет.
+    Возвращает детали последней завершённой тренировки по шаблону одним SQL-запросом.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        preset_id: id_preset.
+        exclude_workout_id: id_workout для исключения из поиска.
+
+    Возвращает:
+        Список строк с упражнениями и подходами или пустой список.
     """
     if exclude_workout_id is not None:
         where_clause = """
@@ -983,7 +1501,20 @@ async def get_previous_set_for_exercise(
     *,
     exclude_workout_id: int | None = None,
 ) -> dict[str, Any] | None:
-    """Подход с тем же номером из предыдущей тренировки по шаблону."""
+    """
+    Возвращает подход с тем же номером из предыдущей тренировки по шаблону.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        preset_id: id_preset.
+        exercise_name: Название упражнения.
+        exercise_type: Тип упражнения (0, 1 или 2).
+        set_number: Номер подхода.
+        exclude_workout_id: id_workout для исключения из поиска.
+
+    Возвращает:
+        Словарь с полями подхода или None, если подход не найден.
+    """
     rows = await get_previous_workout_detail_for_preset(
         user_id,
         preset_id,
@@ -1016,7 +1547,20 @@ async def replace_preset_exercises_from_workout(
     user_id: int,
     workout_id: int,
 ) -> int:
-    """Перезаписывает упражнения шаблона списком из завершённой тренировки."""
+    """
+    Перезаписывает упражнения шаблона списком из завершённой тренировки.
+
+    Параметры:
+        preset_id: id_preset.
+        user_id: Внутренний id_user владельца шаблона.
+        workout_id: id_workout-источника.
+
+    Возвращает:
+        Число упражнений, скопированных в шаблон.
+
+    Исключения:
+        ValueError: Если шаблон не найден или нет доступа.
+    """
     preset = await get_preset_by_id(preset_id)
     if not preset or preset["id_user"] != user_id:
         raise ValueError("Шаблон не найден или нет доступа")
@@ -1035,6 +1579,16 @@ async def replace_preset_exercises_from_workout(
 
 
 async def create_workout(user_id: int, id_preset: int | None = None) -> int:
+    """
+    Создаёт новую активную тренировку.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        id_preset: id_preset или None для свободной тренировки.
+
+    Возвращает:
+        id_workout новой записи.
+    """
     started_at = datetime.now(timezone.utc).replace(tzinfo=None)
     workout_id = await _run_query(
         """
@@ -1055,6 +1609,19 @@ async def add_workout_exercise(
     exercise_type: int,
     category_id: int | None = None,
 ) -> int:
+    """
+    Добавляет упражнение в активную тренировку.
+
+    Параметры:
+        workout_id: id_workout.
+        user_id: Внутренний id_user.
+        exercise_name: Название упражнения.
+        exercise_type: Тип упражнения (0, 1 или 2).
+        category_id: id_category или None.
+
+    Возвращает:
+        id_workout_exercise новой записи.
+    """
     workout_exercise_id = await _run_query(
         """
         INSERT INTO GTB_workout_exercises
@@ -1077,6 +1644,20 @@ async def add_set(
     duration_seconds: int | None = None,
     distance_meters: int | None = None,
 ) -> int:
+    """
+    Добавляет подход к упражнению тренировки.
+
+    Параметры:
+        workout_exercise_id: id_workout_exercise.
+        set_number: Порядковый номер подхода.
+        reps: Повторения (для типов с весом и своим весом).
+        weight: Вес (кг).
+        duration_seconds: Длительность (сек) для упражнений на время.
+        distance_meters: Дистанция (м) для упражнений на время.
+
+    Возвращает:
+        id_set новой записи.
+    """
     set_id = await _run_query(
         """
         INSERT INTO GTB_sets
@@ -1098,7 +1679,15 @@ async def add_set(
 
 
 async def delete_last_set(workout_exercise_id: int) -> int | None:
-    """Удаляет последний подход упражнения. Возвращает номер удалённого подхода."""
+    """
+    Удаляет последний подход упражнения тренировки.
+
+    Параметры:
+        workout_exercise_id: id_workout_exercise.
+
+    Возвращает:
+        Номер удалённого подхода или None, если подходов не было.
+    """
     set_number = await _run_query(
         """
         SELECT TOP 1 set_number
@@ -1123,7 +1712,17 @@ async def delete_last_set(workout_exercise_id: int) -> int | None:
 
 
 async def finish_workout(workout_id: int) -> None:
-    """Завершает тренировку. finished_at — наивный UTC (datetime.now(timezone.utc))."""
+    """
+    Завершает тренировку, записывая finished_at.
+
+    finished_at - наивный UTC (datetime.now(timezone.utc) без tzinfo).
+
+    Параметры:
+        workout_id: id_workout.
+
+    Возвращает:
+        None.
+    """
     finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await _run_query(
         """
@@ -1137,8 +1736,13 @@ async def finish_workout(workout_id: int) -> None:
 
 async def get_workout_statistics(user_id: int) -> dict[str, Any]:
     """
-    Агрегированная статистика тренировок за один запрос к БД:
-    количество сессий (всего / неделя / месяц / год) и суммарный тоннаж.
+    Возвращает агрегированную статистику тренировок одним запросом к БД.
+
+    Параметры:
+        user_id: Внутренний id_user.
+
+    Возвращает:
+        Словарь с workout_count, workout_count_week/month/year и total_weight_lifted_all_time.
     """
     row = await _run_query(
         """
@@ -1197,12 +1801,30 @@ async def get_workout_statistics(user_id: int) -> dict[str, Any]:
 
 
 async def get_user_workout_stats(user_id: int) -> dict[str, Any]:
-    """Обратная совместимость: только общее число завершённых тренировок."""
+    """
+    Обратная совместимость: только общее число завершённых тренировок.
+
+    Параметры:
+        user_id: Внутренний id_user.
+
+    Возвращает:
+        Словарь с ключом workout_count.
+    """
     stats = await get_workout_statistics(user_id)
     return {"workout_count": stats["workout_count"]}
 
 
 async def get_last_workouts(user_id: int, limit: int = 5) -> list[dict[str, Any]]:
+    """
+    Возвращает последние завершённые тренировки пользователя.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        limit: Максимальное число записей, по умолчанию 5.
+
+    Возвращает:
+        Список словарей с полями id, started_at, finished_at.
+    """
     return await _run_query(
         """
         SELECT TOP (?) id_workout AS id, started_at, finished_at
@@ -1219,13 +1841,31 @@ async def get_last_workouts(user_id: int, limit: int = 5) -> list[dict[str, Any]
 
 
 async def get_total_workouts_for_current_month(user_id: int) -> int:
-    """Количество завершённых тренировок за текущий календарный месяц."""
+    """
+    Возвращает количество завершённых тренировок за текущий календарный месяц.
+
+    Параметры:
+        user_id: Внутренний id_user.
+
+    Возвращает:
+        Число тренировок за текущий месяц.
+    """
     stats = await get_workout_statistics(user_id)
     return int(stats["workout_count_month"])
 
 
 async def get_workout_days_for_month(user_id: int, year: int, month: int) -> set[int]:
-    """Множество номеров дней месяца, в которые были завершённые тренировки."""
+    """
+    Возвращает номера дней месяца, в которые были завершённые тренировки.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        year: Год календаря.
+        month: Месяц (1-12).
+
+    Возвращает:
+        Множество номеров дней (DAY(started_at)).
+    """
     rows = await _run_query(
         """
         SELECT DISTINCT DAY(started_at) AS workout_day
@@ -1246,8 +1886,17 @@ async def get_detailed_workouts_by_date(
     selected_date: date,
 ) -> list[dict[str, Any]]:
     """
-    JOIN GTB_workouts, GTB_workout_exercises и GTB_sets за выбранную дату.
-    Фильтр по CAST(w.started_at AS DATE). user_id — внутренний id_user.
+    Возвращает детализацию тренировок за выбранную дату.
+
+    JOIN GTB_workouts, GTB_workout_exercises и GTB_sets.
+    Фильтр по CAST(w.started_at AS DATE).
+
+    Параметры:
+        user_id: Внутренний id_user.
+        selected_date: Календарная дата.
+
+    Возвращает:
+        Список строк с упражнениями и подходами за день.
     """
     return await _fetch_workout_detail_rows(
         "w.id_user = ? AND w.finished_at IS NOT NULL AND CAST(w.started_at AS DATE) = ?",
@@ -1257,7 +1906,15 @@ async def get_detailed_workouts_by_date(
 
 
 async def get_workout_user_id(workout_id: int) -> int | None:
-    """Возвращает id_user владельца тренировки или None."""
+    """
+    Возвращает id_user владельца тренировки.
+
+    Параметры:
+        workout_id: id_workout.
+
+    Возвращает:
+        id_user или None, если тренировка не найдена.
+    """
     user_id = await _run_query(
         """
         SELECT id_user
@@ -1271,7 +1928,15 @@ async def get_workout_user_id(workout_id: int) -> int | None:
 
 
 async def delete_workout(workout_id: int) -> None:
-    """Удаляет тренировку и все связанные подходы/упражнения сессии."""
+    """
+    Удаляет тренировку и все связанные подходы и упражнения сессии.
+
+    Параметры:
+        workout_id: id_workout.
+
+    Возвращает:
+        None.
+    """
     await _run_query(
         """
         DELETE s
@@ -1299,7 +1964,15 @@ async def delete_workout(workout_id: int) -> None:
 
 
 async def get_set_count(workout_exercise_id: int) -> int:
-    """Количество подходов в упражнении тренировки."""
+    """
+    Возвращает количество подходов в упражнении тренировки.
+
+    Параметры:
+        workout_exercise_id: id_workout_exercise.
+
+    Возвращает:
+        Число записей в GTB_sets.
+    """
     count = await _run_query(
         """
         SELECT COUNT(*) AS cnt
@@ -1316,7 +1989,16 @@ async def get_set_by_number(
     workout_exercise_id: int,
     set_number: int,
 ) -> dict[str, Any] | None:
-    """Возвращает подход по номеру внутри упражнения."""
+    """
+    Возвращает подход по номеру внутри упражнения тренировки.
+
+    Параметры:
+        workout_exercise_id: id_workout_exercise.
+        set_number: Номер подхода.
+
+    Возвращает:
+        Словарь с полями id, set_number, weight, reps, duration_seconds, distance_meters или None.
+    """
     return await _run_query(
         """
         SELECT id_set AS id, set_number, weight, reps, duration_seconds, distance_meters
@@ -1336,7 +2018,19 @@ async def update_set(
     duration_seconds: int | None = None,
     distance_meters: int | None = None,
 ) -> None:
-    """Обновляет поля подхода."""
+    """
+    Обновляет поля подхода.
+
+    Параметры:
+        set_id: id_set.
+        reps: Повторения.
+        weight: Вес (кг).
+        duration_seconds: Длительность (сек).
+        distance_meters: Дистанция (м).
+
+    Возвращает:
+        None.
+    """
     await _run_query(
         """
         UPDATE GTB_sets
@@ -1348,16 +2042,17 @@ async def update_set(
 
 
 async def get_workout_detail_by_id(workout_id: int) -> list[dict[str, Any]]:
-    """Детальная информация о конкретной завершённой тренировке."""
+    """
+    Возвращает детальную информацию о конкретной завершённой тренировке.
+
+    Параметры:
+        workout_id: id_workout.
+
+    Возвращает:
+        Список строк с упражнениями и подходами.
+    """
     return await _fetch_workout_detail_rows(
         "w.id_workout = ? AND w.finished_at IS NOT NULL",
         (workout_id,),
         "we.id_workout_exercise, s.set_number",
     )
-
-
-def _normalize_workout_detail_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    for row in rows:
-        row["is_bodyweight"] = _as_exercise_type(row["is_bodyweight"])
-        row["exercise_type"] = row["is_bodyweight"]
-    return rows

@@ -1,4 +1,15 @@
-"""Статистика тренировок с интерактивным календарём."""
+"""
+statistics - статистика и история тренировок
+
+Сводка за месяц, интерактивный календарь, просмотр деталей по дням,
+удаление и редактирование завершённых тренировок.
+
+Ключевые обработчики:
+- show_statistics - пункт меню «Статистика»
+- open_calendar, process_calendar_selection, back_to_calendar - календарь
+- request_delete_workout, confirm_delete_workout - удаление тренировки
+- start_edit_workout, edit_workout_new_value - редактирование подходов
+"""
 
 from __future__ import annotations
 
@@ -45,6 +56,15 @@ logger = logging.getLogger(__name__)
 CALENDAR_LOCALE = "ru_RU"
 
 def _parse_positive_int(text: str | None) -> int | None:
+    """
+    Парсит положительное целое число из текста пользователя.
+
+    Параметры:
+        text: введённый текст или None
+
+    Возвращает:
+        Положительное int или None при некорректном вводе
+    """
     if not text or not text.strip().isdigit():
         return None
     value = int(text.strip())
@@ -55,6 +75,16 @@ async def _verify_workout_access(
     telegram_id: int,
     workout_id: int,
 ) -> tuple[dict | None, str | None]:
+    """
+    Проверяет регистрацию пользователя и право доступа к тренировке.
+
+    Параметры:
+        telegram_id: Telegram id пользователя
+        workout_id: id тренировки в БД
+
+    Возвращает:
+        Кортеж (user, error_message): user при успехе, иначе error для alert
+    """
     user = await db.get_user_by_telegram_id(telegram_id)
     if not user:
         return None, "Сначала нажмите /start"
@@ -69,7 +99,15 @@ async def _verify_workout_access(
 def _has_back_calendar_button(
     reply_markup: InlineKeyboardMarkup | None,
 ) -> bool:
-    """Отчёт открыт из календаря — в разметке есть «Назад в календарь»."""
+    """
+    Проверяет, открыт ли отчёт из календаря (кнопка «Назад в календарь»).
+
+    Параметры:
+        reply_markup: inline-разметка сообщения с отчётом
+
+    Возвращает:
+        True, если в разметке есть stats:back_calendar
+    """
     if not reply_markup or not reply_markup.inline_keyboard:
         return False
     for row in reply_markup.inline_keyboard:
@@ -83,8 +121,13 @@ def _detect_report_style(
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> str:
     """
-    Источник отчёта для восстановления UI после редактирования.
-    Только структура инлайн-кнопок: stats:back_calendar → календарь, иначе — финал.
+    Определяет источник отчёта для восстановления UI после редактирования.
+
+    Параметры:
+        reply_markup: inline-разметка текущего сообщения с отчётом
+
+    Возвращает:
+        Строка «calendar» или «finish» по наличию кнопки возврата в календарь
     """
     return "calendar" if _has_back_calendar_button(reply_markup) else "finish"
 
@@ -96,6 +139,18 @@ def _format_workout_report(
     *,
     utc_offset: timedelta | None = None,
 ) -> str:
+    """
+    Форматирует отчёт тренировки в зависимости от контекста просмотра.
+
+    Параметры:
+        rows: строки детализации тренировки из БД
+        report_style: «calendar» или «finish»
+        calendar_date: дата для календарного формата
+        utc_offset: смещение локального времени пользователя
+
+    Возвращает:
+        HTML-текст отчёта
+    """
     if report_style == "calendar" and calendar_date:
         return format_calendar_workout(
             rows,
@@ -106,6 +161,12 @@ def _format_workout_report(
 
 
 def _calendar_open_keyboard() -> InlineKeyboardMarkup:
+    """
+    Создаёт клавиатуру с кнопкой открытия календаря тренировок.
+
+    Возвращает:
+        InlineKeyboardMarkup с callback stats:calendar
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
@@ -118,7 +179,12 @@ def _calendar_open_keyboard() -> InlineKeyboardMarkup:
 
 @router.message(F.text == "📊 Статистика")
 async def show_statistics(message: Message) -> None:
-    """Главное меню статистики."""
+    """
+    Показывает сводку статистики за текущий месяц и кнопку календаря.
+
+    Параметры:
+        message: входящее сообщение с текстом «Статистика»
+    """
     telegram_id = message.from_user.id
     logger.info("Запрос статистики: telegram_id=%s", telegram_id)
 
@@ -154,7 +220,12 @@ async def show_statistics(message: Message) -> None:
 
 @router.callback_query(F.data == "stats:calendar")
 async def open_calendar(callback: CallbackQuery) -> None:
-    """Открывает календарь с подсветкой дней тренировок."""
+    """
+    Открывает календарь с подсветкой дней, когда были тренировки.
+
+    Параметры:
+        callback: inline-кнопка stats:calendar
+    """
     telegram_id = callback.from_user.id
     logger.info("Открытие календаря: telegram_id=%s", telegram_id)
 
@@ -186,7 +257,13 @@ async def process_calendar_selection(
     callback: CallbackQuery,
     callback_data: SimpleCalendarCallback,
 ) -> None:
-    """Обработка навигации и выбора даты в календаре."""
+    """
+    Обрабатывает навигацию по календарю и выбор даты.
+
+    Параметры:
+        callback: callback от виджета SimpleCalendar
+        callback_data: распарсенные данные календаря (act, year, month, day)
+    """
     telegram_id = callback.from_user.id
 
     if callback_data.act == SimpleCalAct.cancel:
@@ -280,7 +357,12 @@ async def process_calendar_selection(
 
 @router.callback_query(F.data.regexp(r"^stats:back_calendar:\d+:\d+$"))
 async def back_to_calendar(callback: CallbackQuery) -> None:
-    """Возврат к сетке календаря с сохранением месяца и года."""
+    """
+    Возвращает к сетке календаря с сохранением выбранного месяца и года.
+
+    Параметры:
+        callback: inline-кнопка stats:back_calendar:{year}:{month}
+    """
     parts = callback.data.split(":")
     year = int(parts[2])
     month = int(parts[3])
@@ -316,6 +398,12 @@ async def back_to_calendar(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.regexp(r"^workout:delete:\d+$"))
 async def request_delete_workout(callback: CallbackQuery) -> None:
+    """
+    Запрашивает подтверждение удаления тренировки.
+
+    Параметры:
+        callback: inline-кнопка workout:delete:{workout_id}
+    """
     workout_id = int(callback.data.rsplit(":", maxsplit=1)[-1])
     _, error = await _verify_workout_access(callback.from_user.id, workout_id)
     if error:
@@ -332,12 +420,24 @@ async def request_delete_workout(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "workout:delete_cancel")
 async def cancel_delete_workout(callback: CallbackQuery) -> None:
+    """
+    Отменяет удаление тренировки.
+
+    Параметры:
+        callback: inline-кнопка workout:delete_cancel
+    """
     await callback.message.edit_text("Удаление отменено.")
     await callback.answer()
 
 
 @router.callback_query(F.data.regexp(r"^workout:delete_confirm:\d+$"))
 async def confirm_delete_workout(callback: CallbackQuery) -> None:
+    """
+    Удаляет тренировку и все её подходы из БД.
+
+    Параметры:
+        callback: inline-кнопка workout:delete_confirm:{workout_id}
+    """
     workout_id = int(callback.data.rsplit(":", maxsplit=1)[-1])
     _, error = await _verify_workout_access(callback.from_user.id, workout_id)
     if error:
@@ -364,6 +464,13 @@ async def confirm_delete_workout(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.regexp(r"^workout:edit:\d+$"))
 async def start_edit_workout(callback: CallbackQuery, state: FSMContext) -> None:
+    """
+    Начинает редактирование подходов завершённой тренировки.
+
+    Параметры:
+        callback: inline-кнопка workout:edit:{workout_id}
+        state: сохраняет workout_id, report_style и calendar_date
+    """
     workout_id = int(callback.data.rsplit(":", maxsplit=1)[-1])
     _, error = await _verify_workout_access(callback.from_user.id, workout_id)
     if error:
@@ -416,6 +523,13 @@ async def start_edit_workout(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(WorkoutEditStates.waiting_for_exercise_number)
 async def edit_workout_exercise_number(message: Message, state: FSMContext) -> None:
+    """
+    Принимает номер упражнения для редактирования в завершённой тренировке.
+
+    Параметры:
+        message: текстовое сообщение с номером упражнения
+        state: контекст FSM редактирования тренировки
+    """
     exercise_number = _parse_positive_int(message.text)
     data = await state.get_data()
     workout_id = data["workout_id"]
@@ -468,6 +582,13 @@ async def edit_workout_exercise_number(message: Message, state: FSMContext) -> N
 
 @router.message(WorkoutEditStates.waiting_for_set_number)
 async def edit_workout_set_number(message: Message, state: FSMContext) -> None:
+    """
+    Принимает номер подхода для изменения или добавления.
+
+    Параметры:
+        message: текстовое сообщение с номером подхода
+        state: контекст FSM с workout_exercise_id и exercise_type
+    """
     set_number = _parse_positive_int(message.text)
     data = await state.get_data()
     workout_exercise_id = data["workout_exercise_id"]
@@ -551,6 +672,13 @@ async def edit_workout_set_number(message: Message, state: FSMContext) -> None:
 
 @router.message(WorkoutEditStates.waiting_for_new_value)
 async def edit_workout_new_value(message: Message, state: FSMContext) -> None:
+    """
+    Сохраняет новое значение подхода и показывает обновлённый отчёт.
+
+    Параметры:
+        message: текстовое сообщение с весом/повторами или временем
+        state: контекст FSM с set_id или флагом is_new_set
+    """
     data = await state.get_data()
     exercise_type = data["exercise_type"]
     workout_id = data["workout_id"]

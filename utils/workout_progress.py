@@ -1,4 +1,14 @@
-"""Сравнение подходов с предыдущей тренировкой по шаблону."""
+"""
+workout_progress - сравнение подходов с предыдущей тренировкой
+
+Определяет прогресс или регресс относительно прошлого выполнения
+упражнения по тому же шаблону и форматирует значения подходов.
+
+Ключевые компоненты:
+- compare_set_progress - эмодзи-индикатор прогресса подхода
+- format_set_value_for_display - текстовое значение подхода по типу
+- build_previous_sets_map - индекс подходов предыдущей тренировки
+"""
 
 from __future__ import annotations
 
@@ -12,6 +22,15 @@ from utils.text_helpers import format_exercise_time
 
 
 def _format_weight(value: float | None) -> str:
+    """
+    Форматирует вес без лишних нулей после запятой.
+
+    Параметры:
+        value: вес в килограммах или None
+
+    Возвращает:
+        Строку с весом или пустую строку
+    """
     if value is None:
         return ""
     if float(value).is_integer():
@@ -20,6 +39,15 @@ def _format_weight(value: float | None) -> str:
 
 
 def _set_duration_seconds(set_row: dict) -> int:
+    """
+    Извлекает длительность подхода в секундах из записи БД.
+
+    Параметры:
+        set_row: словарь подхода с полями duration_seconds или reps (legacy)
+
+    Возвращает:
+        Число секунд; 0, если поля отсутствуют
+    """
     if set_row.get("duration_seconds") is not None:
         return int(set_row["duration_seconds"])
     if set_row.get("reps") is not None:
@@ -33,7 +61,15 @@ def compare_set_progress(
     exercise_type: int,
 ) -> str:
     """
-    Возвращает эмодзи-индикатор: 🟢 прогресс, 🔴 регресс, ⚪ без выделения.
+    Сравнивает текущий подход с аналогичным из предыдущей тренировки.
+
+    Параметры:
+        current: словарь текущего подхода
+        previous: словарь предыдущего подхода или None
+        exercise_type: тип упражнения (0 - отягощение, 1 - вес, 2 - время)
+
+    Возвращает:
+        «🟢 » при прогрессе, «🔴 » при регрессе, пустую строку без изменений
     """
     if previous is None:
         return ""
@@ -90,6 +126,16 @@ def compare_set_progress(
 
 
 def format_set_value_for_display(set_row: dict, exercise_type: int) -> str:
+    """
+    Форматирует значение одного подхода для отображения в отчёте.
+
+    Параметры:
+        set_row: словарь подхода из БД
+        exercise_type: тип упражнения (0, 1 или 2)
+
+    Возвращает:
+        Строку «80/10», «12 повт.», «1мин. 30сек.» или пустую строку
+    """
     exercise_type = normalize_exercise_type(exercise_type)
     if exercise_type == EXERCISE_BODYWEIGHT:
         return f"{set_row['reps']} повт."
@@ -101,7 +147,15 @@ def format_set_value_for_display(set_row: dict, exercise_type: int) -> str:
 
 
 def build_previous_sets_map(rows: list[dict]) -> dict[tuple[str, int, int], dict]:
-    """Ключ: (exercise_name, exercise_type, set_number)."""
+    """
+    Строит индекс подходов предыдущей тренировки для быстрого сравнения.
+
+    Параметры:
+        rows: плоские строки тренировки из БД
+
+    Возвращает:
+        Словарь с ключом (exercise_name, exercise_type, set_number)
+    """
     result: dict[tuple[str, int, int], dict] = {}
     for row in rows:
         if row.get("set_number") is None:
