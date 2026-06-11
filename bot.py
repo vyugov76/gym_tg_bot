@@ -1,10 +1,13 @@
 """Точка входа: инициализация бота, БД и запуск polling."""
 
-import os
 import asyncio
 import logging
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
+
 from dotenv import load_dotenv
 
 # Явно вычисляем путь к .env относительно этого файла bot.py
@@ -13,12 +16,12 @@ load_dotenv(dotenv_path=env_path)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-import sys
-
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiohttp_socks import ProxyConnector
 
 from database.connection import close_db, init_db
 from handlers.exercises import router as exercises_router
@@ -64,16 +67,48 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 
+def _build_socks5_proxy_url() -> str | None:
+    """SOCKS5 для Telegram API. Пустые PROXY_HOST/PROXY_PORT — прямое подключение."""
+    host = (os.getenv("PROXY_HOST") or "").strip()
+    port = (os.getenv("PROXY_PORT") or "").strip()
+    if not host or not port:
+        return None
+
+    user = (os.getenv("PROXY_USER") or "").strip()
+    password = (os.getenv("PROXY_PASS") or "").strip()
+    if user and password:
+        return (
+            f"socks5://{quote(user, safe='')}:{quote(password, safe='')}"
+            f"@{host}:{port}"
+        )
+    return f"socks5://{host}:{port}"
+
+
+def create_bot() -> Bot:
+    """Bot с SOCKS5-сессией для Telegram или стандартный (локальная разработка)."""
+    bot_kwargs = {
+        "token": BOT_TOKEN,
+        "default": DefaultBotProperties(parse_mode=ParseMode.HTML),
+    }
+    proxy_url = _build_socks5_proxy_url()
+    if proxy_url:
+        session = AiohttpSession(proxy=ProxyConnector.from_url(proxy_url))
+        bot_kwargs["session"] = session
+        host = (os.getenv("PROXY_HOST") or "").strip()
+        port = (os.getenv("PROXY_PORT") or "").strip()
+        logger.info("Telegram API через SOCKS5-прокси %s:%s", host, port)
+    else:
+        logger.info("Telegram API: прямое подключение (прокси не задан)")
+    return Bot(**bot_kwargs)
+
+
 async def main() -> None:
     """Запуск бота: подключение к БД, регистрация роутеров, polling."""
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN не задан. Укажите его в файле .env")
         raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = create_bot()
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.include_router(start_router)

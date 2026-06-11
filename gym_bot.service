@@ -1,0 +1,15 @@
+[Unit]
+Description=Gym Telegram Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# Укажите фактический путь к проекту на сервере:
+WorkingDirectory=/root/Project/gym_tg_bot
+ExecStart=/root/Project/gym_tg_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
