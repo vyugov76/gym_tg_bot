@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator, Literal
 
 import pyodbc
@@ -21,8 +21,31 @@ RETRY_DELAY_SEC = 0.5
 _CONNECTION_ERROR_CODES = frozenset({"08S01", "HYT00", "HYT01", "01000"})
 
 # In-memory cache: admin catalog (id_user IS NULL) changes rarely.
+USER_CACHE_TTL_SECONDS = 7200
+
 _admin_exercises_cache: list[dict[str, Any]] | None = None
-_user_exercises_cache: dict[int, list[dict[str, Any]]] = {}
+_user_exercises_cache: dict[int, dict[str, Any]] = {}
+
+
+def _cache_monotonic_time() -> float:
+    return asyncio.get_event_loop().time()
+
+
+def _store_user_exercises_cache(user_id: int, exercises: list[dict[str, Any]]) -> None:
+    _user_exercises_cache[user_id] = {
+        "data": exercises,
+        "expires_at": _cache_monotonic_time() + USER_CACHE_TTL_SECONDS,
+    }
+
+
+def _get_valid_user_exercises_cache(user_id: int) -> list[dict[str, Any]] | None:
+    entry = _user_exercises_cache.get(user_id)
+    if entry is None:
+        return None
+    if _cache_monotonic_time() >= entry["expires_at"]:
+        _user_exercises_cache.pop(user_id, None)
+        return None
+    return entry["data"]
 
 
 async def _fetch_one_dict(cur) -> dict[str, Any] | None:
@@ -258,8 +281,10 @@ async def _fetch_user_catalog_exercises(
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
     """Личные упражнения пользователя в каталоге, с кэшем на user_id."""
-    if not refresh and user_id in _user_exercises_cache:
-        return _user_exercises_cache[user_id]
+    if not refresh:
+        cached = _get_valid_user_exercises_cache(user_id)
+        if cached is not None:
+            return cached
 
     rows = await _run_query(
         f"""
@@ -273,7 +298,7 @@ async def _fetch_user_catalog_exercises(
         fetch="all",
     )
     normalized = [_normalize_exercise_row(row) for row in rows]
-    _user_exercises_cache[user_id] = normalized
+    _store_user_exercises_cache(user_id, normalized)
     return normalized
 
 
@@ -1010,13 +1035,14 @@ async def replace_preset_exercises_from_workout(
 
 
 async def create_workout(user_id: int, id_preset: int | None = None) -> int:
+    started_at = datetime.now(timezone.utc).replace(tzinfo=None)
     workout_id = await _run_query(
         """
-        INSERT INTO GTB_workouts (id_user, id_preset)
+        INSERT INTO GTB_workouts (id_user, id_preset, started_at)
         OUTPUT INSERTED.id_workout
-        VALUES (?, ?)
+        VALUES (?, ?, ?)
         """,
-        (user_id, id_preset),
+        (user_id, id_preset, started_at),
         fetch="scalar",
     )
     return int(workout_id)
@@ -1097,14 +1123,15 @@ async def delete_last_set(workout_exercise_id: int) -> int | None:
 
 
 async def finish_workout(workout_id: int) -> None:
-    """Завершает тренировку. finished_at ставится на стороне SQL Server (SYSDATETIME)."""
+    """Завершает тренировку. finished_at — наивный UTC (datetime.now(timezone.utc))."""
+    finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await _run_query(
         """
         UPDATE GTB_workouts
-        SET finished_at = SYSDATETIME()
+        SET finished_at = ?
         WHERE id_workout = ?
         """,
-        (workout_id,),
+        (finished_at, workout_id),
     )
 
 

@@ -1,6 +1,7 @@
 """Логика записи тренировки: выбор упражнений и запись подходов."""
 
 import logging
+from datetime import datetime
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -38,7 +39,13 @@ from utils.set_input import (
     parse_weighted_set,
 )
 from utils.text_helpers import format_exercise_time
-from utils.workout_display import format_finish_workout, format_weight
+from utils.workout_display import (
+    format_finish_workout,
+    format_weight,
+    infer_user_utc_offset,
+    utc_offset_from_seconds,
+    utc_offset_to_seconds,
+)
 from utils.workout_progress import format_set_value_for_display
 
 router = Router(name="workout")
@@ -355,6 +362,7 @@ async def _init_workout_state(
     *,
     preset_id: int | None = None,
     preset_queue: list[dict] | None = None,
+    telegram_date: datetime | None = None,
 ) -> int:
     workout_id = await db.create_workout(user["id"], id_preset=preset_id)
     previous_workout_sets = await _load_previous_workout_sets_for_fsm(
@@ -383,6 +391,9 @@ async def _init_workout_state(
         planned_sets_count=0,
         previous_workout_sets=previous_workout_sets,
         show_extra_menu=False,
+        user_utc_offset_seconds=utc_offset_to_seconds(
+            infer_user_utc_offset(telegram_date)
+        ),
         is_new_set=False,
         set_id=None,
     )
@@ -435,8 +446,13 @@ async def _build_finish_report(
     """Формирует текст отчёта и клавиатуру после завершения тренировки."""
     show_save = bool(data.get("empty_workout")) and bool(rows)
     previous_rows = await _load_previous_workout_rows(data, workout_id)
+    utc_offset = utc_offset_from_seconds(data.get("user_utc_offset_seconds"))
     if rows:
-        report = format_finish_workout(rows, previous_rows=previous_rows)
+        report = format_finish_workout(
+            rows,
+            previous_rows=previous_rows,
+            utc_offset=utc_offset,
+        )
     else:
         report = "🎉 Тренировка завершена! Отличная работа!"
     return report, workout_report_keyboard(workout_id, show_save_preset=show_save)
@@ -696,7 +712,11 @@ async def start_workout(message: Message, state: FSMContext) -> None:
         return
 
     try:
-        workout_id = await _init_workout_state(state, user)
+        workout_id = await _init_workout_state(
+            state,
+            user,
+            telegram_date=message.date,
+        )
     except Exception:
         logger.exception("Не удалось создать тренировку: user_id=%s", user_id)
         await message.answer("Не удалось начать тренировку. Попробуйте позже.")
@@ -717,7 +737,11 @@ async def start_empty_workout(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     try:
-        workout_id = await _init_workout_state(state, user)
+        workout_id = await _init_workout_state(
+            state,
+            user,
+            telegram_date=callback.message.date if callback.message else None,
+        )
     except Exception:
         logger.exception("Не удалось создать тренировку: user_id=%s", callback.from_user.id)
         await callback.answer("Ошибка старта тренировки", show_alert=True)
@@ -782,6 +806,7 @@ async def start_preset_workout(callback: CallbackQuery, state: FSMContext) -> No
             user,
             preset_id=preset_id,
             preset_queue=preset_queue,
+            telegram_date=callback.message.date if callback.message else None,
         )
     except Exception:
         logger.exception("Не удалось создать тренировку по пресету: preset_id=%s", preset_id)

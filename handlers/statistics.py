@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -33,7 +33,10 @@ from utils.workout_display import (
     format_calendar_workout,
     format_finish_workout,
     get_exercises_from_rows,
+    infer_user_utc_offset,
     to_local_datetime,
+    utc_offset_from_seconds,
+    utc_offset_to_seconds,
 )
 
 router = Router(name="statistics")
@@ -90,10 +93,16 @@ def _format_workout_report(
     rows: list[dict],
     report_style: str,
     calendar_date: date | None = None,
+    *,
+    utc_offset: timedelta | None = None,
 ) -> str:
     if report_style == "calendar" and calendar_date:
-        return format_calendar_workout(rows, calendar_date)
-    return format_finish_workout(rows)
+        return format_calendar_workout(
+            rows,
+            calendar_date,
+            utc_offset=utc_offset,
+        )
+    return format_finish_workout(rows, utc_offset=utc_offset)
 
 
 def _calendar_open_keyboard() -> InlineKeyboardMarkup:
@@ -235,11 +244,14 @@ async def process_calendar_selection(
     for row in rows:
         workouts_data[row["id_workout"]].append(row)
 
+    utc_offset = infer_user_utc_offset(
+        callback.message.date if callback.message else None
+    )
     for w_rows in workouts_data.values():
         first = w_rows[0]
         workout_id = first["id_workout"]
-        start_local = to_local_datetime(first["started_at"])
-        finish_local = to_local_datetime(first.get("finished_at"))
+        start_local = to_local_datetime(first["started_at"], utc_offset)
+        finish_local = to_local_datetime(first.get("finished_at"), utc_offset)
         duration_min = round(
             (finish_local - start_local).total_seconds() / 60
         ) if finish_local and start_local else 0
@@ -251,7 +263,11 @@ async def process_calendar_selection(
             duration_min,
         )
         await callback.message.answer(
-            format_calendar_workout(w_rows, selected_day),
+            format_calendar_workout(
+                w_rows,
+                selected_day,
+                utc_offset=utc_offset,
+            ),
             reply_markup=calendar_workout_report_keyboard(
                 workout_id,
                 selected_day.year,
@@ -373,14 +389,21 @@ async def start_edit_workout(callback: CallbackQuery, state: FSMContext) -> None
         return
 
     report_style = _detect_report_style(callback.message.reply_markup)
+    utc_offset = infer_user_utc_offset(
+        callback.message.date if callback.message else None
+    )
     calendar_date = None
     if report_style == "calendar" and rows:
-        calendar_date = to_local_datetime(rows[0]["started_at"]).date()
+        calendar_date = to_local_datetime(
+            rows[0]["started_at"],
+            utc_offset,
+        ).date()
 
     await state.update_data(
         workout_id=workout_id,
         report_style=report_style,
         calendar_date=calendar_date.isoformat() if calendar_date else None,
+        user_utc_offset_seconds=utc_offset_to_seconds(utc_offset),
     )
     await state.set_state(WorkoutEditStates.waiting_for_exercise_number)
 
@@ -621,6 +644,7 @@ async def edit_workout_new_value(message: Message, state: FSMContext) -> None:
         rows,
         data.get("report_style", "finish"),
         calendar_date,
+        utc_offset=utc_offset_from_seconds(data.get("user_utc_offset_seconds")),
     )
     await state.clear()
 
