@@ -292,7 +292,7 @@ def exercise_type_keyboard() -> InlineKeyboardMarkup:
 
 
 def after_set_keyboard(*, show_preset_next: bool = False) -> InlineKeyboardMarkup:
-    """Действия после записи подхода (единая клавиатура для всех режимов)."""
+    """Действия после записи подхода (свободная тренировка без шаблона)."""
     next_ex_text = "➡️ Следующее упражнение" if show_preset_next else "🔄 Другое упражнение"
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -306,6 +306,62 @@ def after_set_keyboard(*, show_preset_next: bool = False) -> InlineKeyboardMarku
                 text="✅ Завершить тренировку",
                 callback_data="set:finish",
             )],
+        ]
+    )
+
+
+def preset_after_set_keyboard(
+    *,
+    show_extra_menu: bool = False,
+    completed_sets: int = 0,
+    planned_sets: int = 0,
+    show_preset_next: bool = True,
+) -> InlineKeyboardMarkup:
+    """Двухуровневые действия после подхода в тренировке по шаблону."""
+    next_ex_text = (
+        "➡️ Следующее упражнение"
+        if show_preset_next
+        else "🔄 Другое упражнение"
+    )
+
+    if show_extra_menu:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Ещё подход", callback_data="set:more")],
+                [InlineKeyboardButton(text=next_ex_text, callback_data="set:next_ex")],
+                [InlineKeyboardButton(
+                    text="✅ Завершить тренировку",
+                    callback_data="set:finish",
+                )],
+                [InlineKeyboardButton(text="Назад", callback_data="set:toggle_extra")],
+            ]
+        )
+
+    plan_complete = planned_sets > 0 and completed_sets >= planned_sets
+    if plan_complete:
+        buttons: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(
+                text="✏️ Исправить последний подход",
+                callback_data="set:edit_last",
+            )],
+            [InlineKeyboardButton(text=next_ex_text, callback_data="set:next_ex")],
+            [InlineKeyboardButton(text="...", callback_data="set:toggle_extra")],
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➡️ Следующий подход",
+                    callback_data="set:next_set_step",
+                ),
+                InlineKeyboardButton(
+                    text="✏️ Исправить последний подход",
+                    callback_data="set:edit_last",
+                ),
+            ],
+            [InlineKeyboardButton(text="...", callback_data="set:toggle_extra")],
         ]
     )
 

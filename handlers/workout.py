@@ -13,6 +13,7 @@ from keyboards.menu import (
     exercise_type_keyboard,
     extra_set_confirm_keyboard,
     main_menu_keyboard,
+    preset_after_set_keyboard,
     preset_program_complete_keyboard,
     template_save_keyboard,
     workout_categories_keyboard,
@@ -297,8 +298,26 @@ async def _mark_sets_deviation_if_needed(state: FSMContext) -> None:
         await state.update_data(preset_sets_deviated=True)
 
 
+def _completed_sets_count(data: dict) -> int:
+    return max(0, int(data.get("set_number", 1)) - 1)
+
+
+def _is_planned_sets_complete(data: dict) -> bool:
+    planned = int(data.get("planned_sets_count") or 0)
+    if planned <= 0:
+        return False
+    return _completed_sets_count(data) >= planned
+
+
 def _after_set_keyboard(data: dict):
-    return after_set_keyboard(show_preset_next=_is_preset_sequence_active(data))
+    if not _is_preset_workout(data):
+        return after_set_keyboard(show_preset_next=_is_preset_sequence_active(data))
+    return preset_after_set_keyboard(
+        show_extra_menu=bool(data.get("show_extra_menu")),
+        completed_sets=_completed_sets_count(data),
+        planned_sets=int(data.get("planned_sets_count") or 0),
+        show_preset_next=_is_preset_sequence_active(data),
+    )
 
 
 async def _require_user(message: Message) -> dict | None:
@@ -363,6 +382,7 @@ async def _init_workout_state(
         preset_sets_deviated=False,
         planned_sets_count=0,
         previous_workout_sets=previous_workout_sets,
+        show_extra_menu=False,
         is_new_set=False,
         set_id=None,
     )
@@ -544,6 +564,7 @@ async def _start_workout_exercise(
         exercise_type=exercise_type,
         planned_sets_count=planned_sets_count,
         set_number=1,
+        show_extra_menu=False,
         is_new_set=False,
         set_id=None,
     )
@@ -980,17 +1001,67 @@ async def _prompt_next_set(
     callback: CallbackQuery,
     state: FSMContext,
 ) -> None:
+    await _send_next_set_prompt(callback.from_user.id, callback.message, state)
+
+
+async def _send_next_set_prompt(
+    telegram_id: int,
+    message: Message,
+    state: FSMContext,
+) -> None:
     data = await state.get_data()
     set_number = data.get("set_number", 1)
 
-    await state.update_data(is_new_set=False, set_id=None)
+    await state.update_data(
+        is_new_set=False,
+        set_id=None,
+        show_extra_menu=False,
+    )
+    await _transition_state(
+        state,
+        telegram_id,
+        WorkoutStates.waiting_for_set_value,
+    )
+    prompt = _build_set_prompt(data, set_number)
+    await message.answer(prompt)
+
+
+@router.callback_query(F.data == "set:next_set_step")
+async def next_set_step(callback: CallbackQuery, state: FSMContext) -> None:
+    _log_callback(callback)
+    data = await state.get_data()
+    if not _is_preset_workout(data):
+        await callback.answer()
+        return
+
+    set_number = int(data.get("set_number", 1))
+    await state.update_data(
+        is_new_set=False,
+        set_id=None,
+        show_extra_menu=False,
+    )
     await _transition_state(
         state,
         callback.from_user.id,
         WorkoutStates.waiting_for_set_value,
     )
     prompt = _build_set_prompt(data, set_number)
-    await callback.message.answer(prompt)
+    await callback.message.edit_text(prompt)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "set:toggle_extra")
+async def toggle_extra_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    _log_callback(callback)
+    data = await state.get_data()
+    if not _is_preset_workout(data):
+        await callback.answer()
+        return
+
+    await state.update_data(show_extra_menu=not bool(data.get("show_extra_menu")))
+    data = await state.get_data()
+    await callback.message.edit_reply_markup(reply_markup=_after_set_keyboard(data))
+    await callback.answer()
 
 
 @router.callback_query(F.data == "set:more")
