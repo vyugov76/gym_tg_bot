@@ -10,11 +10,7 @@ from dotenv import load_dotenv
 # Явно вычисляем путь к .env относительно этого файла bot.py
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
-print(f"Ищем файл .env по пути: {env_path}")
-print(f"Файл .env реально существует? -> {env_path.exists()}")
-print(f"Считанный токен: {os.getenv('BOT_TOKEN')}")
 
-# Только ПОСЛЕ этого считываем токен
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 import sys

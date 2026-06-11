@@ -89,33 +89,106 @@ def _example_suffix(previous_hint: str | None, default_example: str) -> str:
     return default_example
 
 
-async def _previous_set_hint(data: dict, set_number: int) -> str | None:
-    preset_id = data.get("preset_id")
-    db_user_id = data.get("db_user_id")
-    exercise_name = data.get("exercise_name")
-    exercise_type = data.get("exercise_type")
-    workout_id = data.get("workout_id")
-    if not preset_id or not db_user_id or not exercise_name:
-        return None
-    prev = await db.get_previous_set_for_exercise(
-        db_user_id,
-        preset_id,
-        exercise_name,
-        normalize_exercise_type(exercise_type),
-        set_number,
-        exclude_workout_id=workout_id,
+def _queue_item_name(item: dict) -> str:
+    """Имя упражнения в элементе очереди шаблона (name или exercise_name)."""
+    return str(item.get("exercise_name") or item.get("name") or "").strip()
+
+
+def _queue_item_type(item: dict) -> int:
+    return normalize_exercise_type(
+        item.get("exercise_type", item.get("is_bodyweight", EXERCISE_WEIGHTED))
     )
+
+
+def _normalize_preset_queue_item(raw: dict) -> dict:
+    """Единый формат элемента preset_queue для FSM и хендлеров."""
+    name = _queue_item_name(raw)
+    exercise_type = _queue_item_type(raw)
+    return {
+        "name": name,
+        "exercise_name": name,
+        "exercise_type": exercise_type,
+        "is_bodyweight": exercise_type,
+        "sets_count": int(raw.get("sets_count") or 0),
+    }
+
+
+def _build_preset_queue(exercises: list[dict]) -> list[dict]:
+    return [
+        _normalize_preset_queue_item({
+            "name": ex.get("name") or ex.get("exercise_name"),
+            "exercise_type": ex.get("exercise_type", ex.get("is_bodyweight")),
+            "sets_count": ex.get("sets_count", 0),
+        })
+        for ex in exercises
+    ]
+
+
+def _get_preset_queue_from_state(data: dict) -> list[dict]:
+    raw_queue = data.get("preset_queue", [])
+    if not isinstance(raw_queue, list):
+        return []
+    return [
+        _normalize_preset_queue_item(item)
+        for item in raw_queue
+        if isinstance(item, dict)
+    ]
+
+
+def _previous_set_key(
+    exercise_name: str,
+    exercise_type: int,
+    set_number: int,
+) -> str:
+    return f"{exercise_name}|{exercise_type}|{set_number}"
+
+
+def _build_previous_sets_map_from_rows(rows: list[dict]) -> dict[str, dict]:
+    """Словарь подходов прошлой тренировки для FSM (JSON-совместимые ключи)."""
+    result: dict[str, dict] = {}
+    for row in rows:
+        if row.get("set_number") is None:
+            continue
+        exercise_name = row.get("exercise_name") or row.get("name")
+        if not exercise_name:
+            continue
+        exercise_type = normalize_exercise_type(
+            row.get("is_bodyweight", row.get("exercise_type"))
+        )
+        key = _previous_set_key(
+            exercise_name,
+            exercise_type,
+            int(row["set_number"]),
+        )
+        result[key] = {
+            "set_number": int(row["set_number"]),
+            "weight": row.get("weight"),
+            "reps": row.get("reps"),
+            "duration_seconds": row.get("duration_seconds"),
+            "distance_meters": row.get("distance_meters"),
+        }
+    return result
+
+
+def _previous_set_hint(data: dict, set_number: int) -> str | None:
+    exercise_name = data.get("exercise_name")
+    exercise_type = normalize_exercise_type(data.get("exercise_type"))
+    if not exercise_name or not data.get("preset_id"):
+        return None
+
+    key = _previous_set_key(exercise_name, exercise_type, set_number)
+    prev = data.get("previous_workout_sets", {}).get(key)
     if not prev:
         return None
-    return format_set_value_for_display(prev, normalize_exercise_type(exercise_type))
+    return format_set_value_for_display(prev, exercise_type)
 
 
-async def _build_set_prompt(data: dict, set_number: int) -> str:
+def _build_set_prompt(data: dict, set_number: int) -> str:
     exercise_name = data["exercise_name"]
     exercise_type = normalize_exercise_type(data.get("exercise_type"))
     planned_sets = int(data.get("planned_sets_count") or 0)
     set_label = _set_number_label(set_number, planned_sets)
-    prev_hint = await _previous_set_hint(data, set_number)
+    prev_hint = _previous_set_hint(data, set_number)
 
     if exercise_type == EXERCISE_BODYWEIGHT:
         example = _example_suffix(prev_hint, "например, 12")
@@ -239,6 +312,24 @@ async def _require_user(message: Message) -> dict | None:
     return user
 
 
+async def _load_previous_workout_sets_for_fsm(
+    user_id: int,
+    preset_id: int | None,
+    workout_id: int,
+) -> dict[str, dict]:
+    """Один SQL-запрос: подходы последней тренировки по шаблону для подсказок."""
+    if preset_id is None:
+        return {}
+    rows = await db.get_previous_workout_detail_for_preset(
+        user_id,
+        preset_id,
+        exclude_workout_id=workout_id,
+    )
+    if not rows:
+        return {}
+    return _build_previous_sets_map_from_rows(rows)
+
+
 async def _init_workout_state(
     state: FSMContext,
     user: dict,
@@ -247,6 +338,13 @@ async def _init_workout_state(
     preset_queue: list[dict] | None = None,
 ) -> int:
     workout_id = await db.create_workout(user["id"], id_preset=preset_id)
+    previous_workout_sets = await _load_previous_workout_sets_for_fsm(
+        user["id"],
+        preset_id,
+        workout_id,
+    )
+    normalized_queue = _build_preset_queue(preset_queue) if preset_queue else []
+
     await state.update_data(
         workout_id=workout_id,
         set_number=1,
@@ -256,7 +354,7 @@ async def _init_workout_state(
         db_user_id=user["id"],
         exercise_catalog=[],
         preset_id=preset_id,
-        preset_queue=preset_queue or [],
+        preset_queue=normalized_queue,
         preset_index=0,
         preset_queue_exhausted=False,
         empty_workout=preset_id is None,
@@ -264,6 +362,7 @@ async def _init_workout_state(
         is_preset_modified=False,
         preset_sets_deviated=False,
         planned_sets_count=0,
+        previous_workout_sets=previous_workout_sets,
         is_new_set=False,
         set_id=None,
     )
@@ -271,7 +370,11 @@ async def _init_workout_state(
 
 
 def _preset_exercise_keys(preset_queue: list[dict]) -> set[tuple[str, int]]:
-    return {(ex["name"], ex["exercise_type"]) for ex in preset_queue}
+    return {
+        (_queue_item_name(ex), _queue_item_type(ex))
+        for ex in preset_queue
+        if isinstance(ex, dict) and _queue_item_name(ex)
+    }
 
 
 async def _mark_preset_modified_if_needed(
@@ -281,7 +384,7 @@ async def _mark_preset_modified_if_needed(
 ) -> None:
     """Взводит флаг, если упражнение не входило в исходный шаблон."""
     data = await state.get_data()
-    preset_queue = data.get("preset_queue", [])
+    preset_queue = _get_preset_queue_from_state(data)
     if not data.get("preset_id") or not preset_queue:
         return
     if (exercise_name, exercise_type) not in _preset_exercise_keys(preset_queue):
@@ -296,14 +399,12 @@ async def _load_previous_workout_rows(
     db_user_id = data.get("db_user_id")
     if not preset_id or not db_user_id:
         return None
-    prev_id = await db.get_previous_finished_workout_id(
+    rows = await db.get_previous_workout_detail_for_preset(
         db_user_id,
         preset_id,
         exclude_workout_id=workout_id,
     )
-    if prev_id is None:
-        return None
-    return await db.get_workout_detail_by_id(prev_id)
+    return rows or None
 
 
 async def _build_finish_report(
@@ -449,7 +550,7 @@ async def _start_workout_exercise(
     await _transition_state(state, telegram_id, WorkoutStates.waiting_for_set_value)
 
     data = await state.get_data()
-    prompt = await _build_set_prompt(data, 1)
+    prompt = _build_set_prompt(data, 1)
     if isinstance(callback, CallbackQuery):
         await callback.message.edit_text(prompt)
     else:
@@ -522,8 +623,8 @@ async def _start_next_preset_exercise(
 ) -> bool:
     """Запускает следующее упражнение из пресета. False — если упражнения закончились."""
     data = await state.get_data()
-    preset_queue = data.get("preset_queue", [])
-    preset_index = data.get("preset_index", 0)
+    preset_queue = _get_preset_queue_from_state(data)
+    preset_index = int(data.get("preset_index", 0))
 
     if preset_index >= len(preset_queue):
         await state.update_data(preset_queue_exhausted=True)
@@ -535,13 +636,16 @@ async def _start_next_preset_exercise(
         return False
 
     exercise = preset_queue[preset_index]
-    await state.update_data(preset_index=preset_index + 1)
+    await state.update_data(
+        preset_queue=preset_queue,
+        preset_index=preset_index + 1,
+    )
     await _start_workout_exercise(
         callback,
         state,
-        exercise["name"],
+        exercise["exercise_name"],
         exercise["exercise_type"],
-        planned_sets_count=int(exercise.get("sets_count") or 0),
+        planned_sets_count=exercise["sets_count"],
     )
     return True
 
@@ -649,14 +753,7 @@ async def start_preset_workout(callback: CallbackQuery, state: FSMContext) -> No
         await callback.answer("В программе нет упражнений", show_alert=True)
         return
 
-    preset_queue = [
-        {
-            "name": ex["name"],
-            "exercise_type": ex["exercise_type"],
-            "sets_count": int(ex.get("sets_count") or 0),
-        }
-        for ex in exercises
-    ]
+    preset_queue = _build_preset_queue(exercises)
 
     try:
         workout_id = await _init_workout_state(
@@ -892,7 +989,7 @@ async def _prompt_next_set(
         callback.from_user.id,
         WorkoutStates.waiting_for_set_value,
     )
-    prompt = await _build_set_prompt(data, set_number)
+    prompt = _build_set_prompt(data, set_number)
     await callback.message.answer(prompt)
 
 
@@ -965,7 +1062,7 @@ async def edit_last_set(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     data = await state.get_data()
-    prompt = await _build_set_prompt(data, deleted_set_number)
+    prompt = _build_set_prompt(data, deleted_set_number)
     await callback.message.answer(
         f"Подход {deleted_set_number} удалён. Введите данные заново:\n\n{prompt}"
     )

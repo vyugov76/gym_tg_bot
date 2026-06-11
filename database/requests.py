@@ -129,7 +129,7 @@ async def _run_query(
 
     for attempt in range(1, MAX_QUERY_ATTEMPTS + 1):
         try:
-            logger.info(
+            logger.debug(
                 "Выполнение SQL (попытка %s/%s): %s с параметрами: %s",
                 attempt,
                 MAX_QUERY_ATTEMPTS,
@@ -471,8 +471,21 @@ async def get_exercises_by_category(
     *,
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    catalog = await get_global_exercises_by_user_id(user_id, refresh=refresh)
-    return [row for row in catalog if row.get("category_id") == category_id]
+    """Упражнения категории: фильтрация на стороне СУБД."""
+    del refresh  # точечный запрос всегда читает актуальные данные из БД
+    rows = await _run_query(
+        f"""
+        {_CATALOG_SELECT}
+        WHERE workout_id IS NULL
+          AND is_deleted = 0
+          AND category_id = ?
+          AND (id_user = ? OR id_user IS NULL)
+        ORDER BY exercise_name
+        """,
+        (category_id, user_id),
+        fetch="all",
+    )
+    return [_normalize_exercise_row(row) for row in rows]
 
 
 async def get_unsorted_exercises(
@@ -480,8 +493,21 @@ async def get_unsorted_exercises(
     *,
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    catalog = await get_global_exercises_by_user_id(user_id, refresh=refresh)
-    return [row for row in catalog if row.get("category_id") is None]
+    """Несортированные упражнения: category_id IS NULL в SQL."""
+    del refresh
+    rows = await _run_query(
+        f"""
+        {_CATALOG_SELECT}
+        WHERE workout_id IS NULL
+          AND is_deleted = 0
+          AND category_id IS NULL
+          AND (id_user = ? OR id_user IS NULL)
+        ORDER BY exercise_name
+        """,
+        (user_id,),
+        fetch="all",
+    )
+    return [_normalize_exercise_row(row) for row in rows]
 
 
 async def get_exercise_by_id(exercise_id: int) -> dict[str, Any] | None:
@@ -877,6 +903,52 @@ async def get_previous_finished_workout_id(
     return int(workout_id) if workout_id is not None else None
 
 
+async def get_previous_workout_detail_for_preset(
+    user_id: int,
+    preset_id: int,
+    *,
+    exclude_workout_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Детали последней завершённой тренировки по шаблону — один SQL-запрос.
+    Пустой список, если предыдущих сессий нет.
+    """
+    if exclude_workout_id is not None:
+        where_clause = """
+            w.id_workout = (
+                SELECT TOP 1 id_workout
+                FROM GTB_workouts
+                WHERE id_user = ?
+                  AND id_preset = ?
+                  AND finished_at IS NOT NULL
+                  AND id_workout <> ?
+                ORDER BY finished_at DESC
+            )
+            AND w.finished_at IS NOT NULL
+        """
+        params: tuple = (user_id, preset_id, exclude_workout_id)
+    else:
+        where_clause = """
+            w.id_workout = (
+                SELECT TOP 1 id_workout
+                FROM GTB_workouts
+                WHERE id_user = ?
+                  AND id_preset = ?
+                  AND finished_at IS NOT NULL
+                ORDER BY finished_at DESC
+            )
+            AND w.finished_at IS NOT NULL
+        """
+        params = (user_id, preset_id)
+
+    rows = await _fetch_workout_detail_rows(
+        where_clause,
+        params,
+        "we.id_workout_exercise, s.set_number",
+    )
+    return rows
+
+
 async def get_previous_set_for_exercise(
     user_id: int,
     preset_id: int,
@@ -887,33 +959,31 @@ async def get_previous_set_for_exercise(
     exclude_workout_id: int | None = None,
 ) -> dict[str, Any] | None:
     """Подход с тем же номером из предыдущей тренировки по шаблону."""
-    prev_workout_id = await get_previous_finished_workout_id(
+    rows = await get_previous_workout_detail_for_preset(
         user_id,
         preset_id,
         exclude_workout_id=exclude_workout_id,
     )
-    if prev_workout_id is None:
+    if not rows:
         return None
-    return await _run_query(
-        """
-        SELECT TOP 1
-            s.set_number,
-            s.weight,
-            s.reps,
-            s.duration_seconds,
-            s.distance_meters
-        FROM GTB_sets s
-        INNER JOIN GTB_workout_exercises we
-            ON we.id_workout_exercise = s.id_workout_exercise
-        WHERE we.workout_id = ?
-          AND we.exercise_name = ?
-          AND we.is_bodyweight = ?
-          AND s.set_number = ?
-        ORDER BY s.id_set DESC
-        """,
-        (prev_workout_id, exercise_name, exercise_type, set_number),
-        fetch="one",
-    )
+
+    exercise_type = _as_exercise_type(exercise_type)
+    for row in rows:
+        if row.get("set_number") is None:
+            continue
+        if (
+            row["exercise_name"] == exercise_name
+            and _as_exercise_type(row["is_bodyweight"]) == exercise_type
+            and int(row["set_number"]) == set_number
+        ):
+            return {
+                "set_number": row["set_number"],
+                "weight": row.get("weight"),
+                "reps": row.get("reps"),
+                "duration_seconds": row.get("duration_seconds"),
+                "distance_meters": row.get("distance_meters"),
+            }
+    return None
 
 
 async def replace_preset_exercises_from_workout(

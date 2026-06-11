@@ -1,7 +1,7 @@
 """Асинхронное подключение к MS SQL Server через ODBC (aioodbc)."""
 
 from __future__ import annotations
-
+from pathlib import Path 
 import asyncio
 import logging
 import os
@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
 current_path = os.path.abspath(__file__)
 
 # Отсекаем всё, что идет после названия корневой папки проекта
-root_dir = current_path.split("gym_tg_bot")[0] + "gym_tg_bot"
+root_dir = Path(__file__).resolve().parent.parent
 
 # Собираем идеальный абсолютный путь к .env
-env_path = os.path.join(root_dir, ".env")
+env_path = root_dir / ".env"
 
 # Загружаем переменные окружения
 load_dotenv(dotenv_path=env_path)
