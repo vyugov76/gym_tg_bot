@@ -30,7 +30,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 _pool: aioodbc.Pool | None = None
 _pool_generation = 0
-db_pool_lock = asyncio.Lock()
+_db_lock = asyncio.Lock()
 
 POOL_MINSIZE = 1
 POOL_MAXSIZE = 10
@@ -102,7 +102,7 @@ async def apply_schema_migrations() -> None:
     Возвращает:
         None.
     """
-    pool = get_pool()
+    pool = await get_pool()
     conn = await pool.acquire()
     try:
         async with conn.cursor() as cur:
@@ -150,17 +150,20 @@ async def init_db() -> None:
     if _pool is not None:
         return
 
-    async with db_pool_lock:
+    async with _db_lock:
         if _pool is not None:
             return
 
         retries = 5
         last_error: Exception | None = None
+        pool_ready = False
 
         for attempt in range(1, retries + 1):
             logger.info("Попытка подключения к БД %s/%s...", attempt, retries)
             try:
-                _pool = await _create_pool()
+                new_pool = await _create_pool()
+                _pool = new_pool
+                pool_ready = True
                 logger.info("Пул соединений с БД успешно создан!")
                 logger.info(
                     "Параметры пула: driver=%s server=%s database=%s user=%s "
@@ -172,8 +175,7 @@ async def init_db() -> None:
                     POOL_MINSIZE,
                     POOL_MAXSIZE,
                 )
-                await apply_schema_migrations()
-                return
+                break
             except Exception as e:
                 last_error = e
                 _pool = None
@@ -185,15 +187,19 @@ async def init_db() -> None:
                 if attempt < retries:
                     await asyncio.sleep(3)
 
-        logger.critical("Все попытки подключения к базе данных исчерпаны.")
-        raise last_error
+        if not pool_ready:
+            logger.critical("Все попытки подключения к базе данных исчерпаны.")
+            raise last_error
+
+    await apply_schema_migrations()
 
 
 async def refresh_db_pool() -> None:
     """
     Пересоздаёт пул после потери соединения (таймаут простоя и т.п.).
 
-    Использует счётчик generation, чтобы параллельные задачи не пересоздавали пул дважды.
+    Сначала создаёт новый пул, затем атомарно подменяет глобальный экземпляр.
+    Старый пул закрывается уже после подмены, вне критической секции.
 
     Возвращает:
         None.
@@ -201,8 +207,9 @@ async def refresh_db_pool() -> None:
     global _pool, _pool_generation
 
     generation_before = _pool_generation
+    old_pool: aioodbc.Pool | None = None
 
-    async with db_pool_lock:
+    async with _db_lock:
         if _pool_generation != generation_before:
             logger.info(
                 "Пул уже пересоздан другой задачей (generation %s -> %s), пропускаем",
@@ -213,14 +220,15 @@ async def refresh_db_pool() -> None:
 
         logger.warning("Пересоздание пула соединений с БД...")
         old_pool = _pool
-        _pool = None
-        await _close_pool(old_pool)
-        _pool = await _create_pool()
+        new_pool = await _create_pool()
+        _pool = new_pool
         _pool_generation += 1
         logger.info(
             "Пул соединений с БД успешно пересоздан (generation=%s)",
             _pool_generation,
         )
+
+    await _close_pool(old_pool)
 
 
 async def close_db() -> None:
@@ -234,7 +242,7 @@ async def close_db() -> None:
     """
     global _pool
 
-    async with db_pool_lock:
+    async with _db_lock:
         if _pool is None:
             return
         pool = _pool
@@ -244,19 +252,24 @@ async def close_db() -> None:
         logger.info("Пул соединений с БД закрыт")
 
 
-def get_pool() -> aioodbc.Pool:
+async def get_pool() -> aioodbc.Pool:
     """
     Возвращает активный пул соединений.
+
+    Если пул пересоздаётся, ожидает освобождения _db_lock и возвращает новый экземпляр.
 
     Возвращает:
         Текущий aioodbc.Pool.
 
     Исключения:
-        RuntimeError: Если init_db() ещё не вызывался.
+        RuntimeError: Если init_db() ещё не вызывался или пул не создан.
     """
-    if _pool is None:
-        raise RuntimeError("Пул БД не инициализирован. Вызовите init_db() перед работой.")
-    return _pool
+    async with _db_lock:
+        if _pool is None:
+            raise RuntimeError(
+                "Пул БД не инициализирован. Вызовите init_db() перед работой."
+            )
+        return _pool
 
 
 async def discard_connection(conn) -> None:

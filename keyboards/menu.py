@@ -3,7 +3,7 @@
 
 Ключевые компоненты:
 - main_menu_keyboard, settings_menu_keyboard - главное меню и настройки
-- categories_list_keyboard, category_detail_keyboard - управление категориями
+- categories_list_keyboard - управление категориями
 - presets_list_keyboard, preset_detail_keyboard - готовые тренировки
 - workout_start_choice_keyboard, workout_categories_keyboard - сценарий тренировки
 - after_set_keyboard, preset_after_set_keyboard - действия после подхода
@@ -97,38 +97,6 @@ def categories_list_keyboard(categories: list[dict[str, Any]]) -> InlineKeyboard
         callback_data="settings:back",
     )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def category_detail_keyboard(category_id: int) -> InlineKeyboardMarkup:
-    """
-    Действия внутри выбранной категории.
-
-    Параметры:
-        category_id: идентификатор категории.
-
-    Возвращает:
-        InlineKeyboardMarkup: добавление, удаление упражнений и удаление категории.
-    """
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(
-                text="➕ Добавить упражнения",
-                callback_data=f"cat:bulk_add:{category_id}",
-            )],
-            [InlineKeyboardButton(
-                text="➖ Удалить упражнения",
-                callback_data=f"cat:bulk_rm:{category_id}",
-            )],
-            [InlineKeyboardButton(
-                text="❌ Удалить категорию",
-                callback_data=f"cat:delete:{category_id}",
-            )],
-            [InlineKeyboardButton(
-                text="◀️ К списку категорий",
-                callback_data="settings:categories",
-            )],
-        ]
-    )
 
 
 def presets_list_keyboard(presets: list[dict[str, Any]]) -> InlineKeyboardMarkup:
@@ -569,15 +537,20 @@ def template_save_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def my_exercises_keyboard(exercises: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+def my_exercises_keyboard(
+    exercises: list[dict[str, Any]],
+    *,
+    category_token: str,
+) -> InlineKeyboardMarkup:
     """
-    Список упражнений пользователя в категории.
+    Список упражнений пользователя в категории настроек.
 
     Параметры:
-        exercises: упражнения с полями id, name и опционально id_user.
+        exercises: упражнения с полями id, name и опционально id_user
+        category_token: id категории в виде строки или none для несортированных
 
     Возвращает:
-        InlineKeyboardMarkup: упражнения с иконками и меткой глобальных записей.
+        InlineKeyboardMarkup: упражнения, bulk-действия, создание и управление категорией
     """
     buttons = []
     for ex in exercises:
@@ -588,10 +561,45 @@ def my_exercises_keyboard(exercises: list[dict[str, Any]]) -> InlineKeyboardMark
             callback_data=f"myex:view:{ex['id']}",
         )])
     if not buttons:
+        empty_text = (
+            "Упражнений пока нет"
+            if category_token == "none"
+            else "Упражнений в этой категории пока нет"
+        )
         buttons.append([InlineKeyboardButton(
-            text="Упражнений в этой категории пока нет",
+            text=empty_text,
             callback_data="myex:noop",
         )])
+    buttons.append([InlineKeyboardButton(
+        text="➕ Создать упражнение",
+        callback_data=f"shortcut_add_ex:{category_token}",
+    )])
+    if category_token != "none":
+        category_id = category_token
+        buttons.append([
+            InlineKeyboardButton(
+                text="📥 Добавить из несортированных",
+                callback_data=f"cat:bulk_add:{category_id}",
+            ),
+            InlineKeyboardButton(
+                text="📤 Исключить из категории",
+                callback_data=f"cat:bulk_rm:{category_id}",
+            ),
+        ])
+        buttons.append([
+            InlineKeyboardButton(
+                text="✏️ Изменить название",
+                callback_data=f"cat:rename:{category_id}",
+            ),
+            InlineKeyboardButton(
+                text="🗑️ Удалить категорию",
+                callback_data=f"cat:delete:{category_id}",
+            ),
+        ])
+    buttons.append([InlineKeyboardButton(
+        text="◀️ Назад",
+        callback_data="settings:categories",
+    )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 

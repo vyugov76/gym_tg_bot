@@ -65,9 +65,11 @@ class CategoryStates(StatesGroup):
 
     Состояния:
         waiting_for_name - ввод названия категории
+        waiting_for_rename - ввод нового названия существующей категории
     """
 
     waiting_for_name = State()
+    waiting_for_rename = State()
 
 
 class PresetSaveStates(StatesGroup):

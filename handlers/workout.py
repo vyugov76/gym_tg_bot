@@ -58,6 +58,7 @@ from utils.workout_display import (
     utc_offset_to_seconds,
 )
 from utils.workout_progress import format_set_value_for_display
+from utils.screen_message import show_screen_message, store_screen_message
 
 router = Router(name="workout")
 logger = logging.getLogger(__name__)
@@ -132,35 +133,45 @@ def _is_preset_sequence_active(data: dict) -> bool:
     )
 
 
-def _set_number_label(set_number: int, planned_sets: int) -> str:
+def _set_number_label(
+    set_number: int,
+    planned_sets: int,
+    *,
+    previous_hint: str | None = None,
+) -> str:
     """
     Формирует подпись номера подхода для сообщений пользователю.
 
     Параметры:
         set_number: текущий номер подхода
         planned_sets: плановое число подходов из шаблона (0 - без плана)
+        previous_hint: форматированный результат прошлого подхода или None
 
     Возвращает:
-        Строка вида «Подход N» или «Подход N/M»
+        Строка вида «Подход N» или «Подход N/M» с опциональной прошлой записью
     """
     if planned_sets > 0:
-        return f"Подход {set_number}/{planned_sets}"
-    return f"Подход {set_number}"
+        label = f"Подход {set_number}/{planned_sets}"
+    else:
+        label = f"Подход {set_number}"
+    if previous_hint:
+        return f"{label}: (Прошлая: {previous_hint})"
+    return label
 
 
 def _example_suffix(previous_hint: str | None, default_example: str) -> str:
     """
-    Добавляет подсказку из прошлой тренировки или пример по умолчанию.
+    Возвращает пример формата ввода, если прошлый результат уже не показан.
 
     Параметры:
         previous_hint: форматированное значение прошлого подхода или None
-        default_example: текст примера, если подсказки нет
+        default_example: текст примера при отсутствии прошлых данных
 
     Возвращает:
-        Строка в скобках для вставки в prompt
+        Строка-пример для подсказки в prompt
     """
     if previous_hint:
-        return f"(прошлая тренировка: {previous_hint})"
+        return ""
     return default_example
 
 
@@ -307,6 +318,28 @@ def _build_previous_sets_map_from_rows(rows: list[dict]) -> dict[str, dict]:
     return result
 
 
+def _format_previous_hint_for_prompt(prev: dict, exercise_type: int) -> str:
+    """
+    Форматирует прошлый подход для подписи в prompt ввода.
+
+    Параметры:
+        prev: словарь подхода из прошлой тренировки
+        exercise_type: тип упражнения
+
+    Возвращает:
+        Читаемая строка, например «80 кг x 10» или «12 повт.»
+    """
+    exercise_type = normalize_exercise_type(exercise_type)
+    if exercise_type == EXERCISE_WEIGHTED:
+        weight = prev.get("weight")
+        reps = prev.get("reps")
+        if weight is None or reps is None:
+            return format_set_value_for_display(prev, exercise_type)
+        weight_text = int(weight) if float(weight).is_integer() else weight
+        return f"{weight_text} кг x {reps}"
+    return format_set_value_for_display(prev, exercise_type)
+
+
 def _previous_set_hint(data: dict, set_number: int) -> str | None:
     """
     Возвращает подсказку из прошлой тренировки для текущего подхода.
@@ -320,19 +353,21 @@ def _previous_set_hint(data: dict, set_number: int) -> str | None:
     """
     exercise_name = data.get("exercise_name")
     exercise_type = normalize_exercise_type(data.get("exercise_type"))
-    if not exercise_name or not data.get("preset_id"):
+    if not exercise_name:
         return None
 
     key = _previous_set_key(exercise_name, exercise_type, set_number)
     prev = data.get("previous_workout_sets", {}).get(key)
     if not prev:
         return None
-    return format_set_value_for_display(prev, exercise_type)
+    return _format_previous_hint_for_prompt(prev, exercise_type)
 
 
 def _build_set_prompt(data: dict, set_number: int) -> str:
     """
     Формирует текст запроса ввода данных подхода.
+
+    Прошлый результат показывается только в подписи подхода, без отдельной строки.
 
     Параметры:
         data: данные FSM с exercise_name и exercise_type
@@ -344,25 +379,35 @@ def _build_set_prompt(data: dict, set_number: int) -> str:
     exercise_name = data["exercise_name"]
     exercise_type = normalize_exercise_type(data.get("exercise_type"))
     planned_sets = int(data.get("planned_sets_count") or 0)
-    set_label = _set_number_label(set_number, planned_sets)
     prev_hint = _previous_set_hint(data, set_number)
+    set_label = _set_number_label(
+        set_number,
+        planned_sets,
+        previous_hint=prev_hint,
+    )
 
     if exercise_type == EXERCISE_BODYWEIGHT:
         example = _example_suffix(prev_hint, "например, 12")
+        suffix = f" {example}" if example else ""
         return (
             f"Упражнение: <b>{exercise_name}</b> (собственный вес)\n"
-            f"{set_label} - введите <b>количество повторений</b> {example}:"
+            f"{set_label}\n"
+            f"Введите <b>количество повторений</b>{suffix}:"
         )
     if exercise_type == EXERCISE_TIMED:
         example = _example_suffix(prev_hint, "например, 30 или 1:30")
+        suffix = f" {example}" if example else ""
         return (
             f"Упражнение: <b>{exercise_name}</b> (на время)\n"
-            f"{set_label} - введите <b>время</b> {example}:"
+            f"{set_label}\n"
+            f"Введите <b>время</b>{suffix}:"
         )
     example = _example_suffix(prev_hint, "например, 60/10")
+    suffix = f" {example}" if example else ""
     return (
         f"Упражнение: <b>{exercise_name}</b>\n"
-        f"{set_label} - введите <b>вес/повторения</b> {example}:"
+        f"{set_label}\n"
+        f"Введите <b>вес/повторения</b>{suffix}:"
     )
 
 
@@ -567,6 +612,48 @@ async def _load_previous_workout_sets_for_fsm(
     return _build_previous_sets_map_from_rows(rows)
 
 
+async def _merge_previous_sets_for_exercise(
+    state: FSMContext,
+    exercise_name: str,
+    exercise_type: int,
+) -> None:
+    """
+    Дополняет FSM подходами упражнения из последней завершённой тренировки.
+
+    Для шаблонной тренировки берёт прошлую сессию по шаблону, иначе - любую
+    последнюю тренировку с этим упражнением.
+
+    Параметры:
+        state: контекст FSM с db_user_id и workout_id
+        exercise_name: название текущего упражнения
+        exercise_type: тип упражнения
+    """
+    data = await state.get_data()
+    db_user_id = data.get("db_user_id")
+    workout_id = data.get("workout_id")
+    if not db_user_id or not exercise_name:
+        return
+
+    preset_id = data.get("preset_id")
+    if preset_id:
+        rows = await db.get_previous_workout_detail_for_preset(
+            db_user_id,
+            preset_id,
+            exclude_workout_id=workout_id,
+        )
+    else:
+        rows = await db.get_previous_workout_sets_for_exercise(
+            db_user_id,
+            exercise_name,
+            exercise_type,
+            exclude_workout_id=workout_id,
+        )
+
+    merged = dict(data.get("previous_workout_sets") or {})
+    merged.update(_build_previous_sets_map_from_rows(rows))
+    await state.update_data(previous_workout_sets=merged)
+
+
 async def _init_workout_state(
     state: FSMContext,
     user: dict,
@@ -665,27 +752,60 @@ async def _mark_preset_modified_if_needed(
 async def _load_previous_workout_rows(
     data: dict,
     workout_id: int,
+    current_rows: list[dict] | None = None,
 ) -> list[dict] | None:
     """
-    Загружает детали предыдущей тренировки по тому же шаблону.
+    Загружает строки предыдущей тренировки для сравнения в итоговом отчёте.
+
+    Для шаблонной тренировки сравнивает с прошлой сессией по шаблону.
+    Для свободной - собирает прошлые подходы по каждому упражнению отдельно.
 
     Параметры:
         data: данные FSM с preset_id и db_user_id
         workout_id: id текущей тренировки (исключается)
+        current_rows: строки текущей тренировки для свободного режима
 
     Возвращает:
-        Строки детализации или None, если шаблон не использовался
+        Строки детализации или None, если сравнение невозможно
     """
     preset_id = data.get("preset_id")
     db_user_id = data.get("db_user_id")
-    if not preset_id or not db_user_id:
+    if not db_user_id:
         return None
-    rows = await db.get_previous_workout_detail_for_preset(
-        db_user_id,
-        preset_id,
-        exclude_workout_id=workout_id,
-    )
-    return rows or None
+
+    if preset_id:
+        rows = await db.get_previous_workout_detail_for_preset(
+            db_user_id,
+            preset_id,
+            exclude_workout_id=workout_id,
+        )
+        return rows or None
+
+    if not current_rows:
+        return None
+
+    previous_rows: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for row in current_rows:
+        if row.get("set_number") is None:
+            continue
+        exercise_name = row.get("exercise_name")
+        exercise_type = normalize_exercise_type(row.get("is_bodyweight"))
+        if not exercise_name:
+            continue
+        key = (exercise_name, exercise_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        exercise_rows = await db.get_previous_workout_sets_for_exercise(
+            db_user_id,
+            exercise_name,
+            exercise_type,
+            exclude_workout_id=workout_id,
+        )
+        previous_rows.extend(exercise_rows)
+
+    return previous_rows or None
 
 
 async def _build_finish_report(
@@ -705,7 +825,7 @@ async def _build_finish_report(
         Кортеж (report_text, reply_markup)
     """
     show_save = bool(data.get("empty_workout")) and bool(rows)
-    previous_rows = await _load_previous_workout_rows(data, workout_id)
+    previous_rows = await _load_previous_workout_rows(data, workout_id, rows)
     utc_offset = utc_offset_from_seconds(data.get("user_utc_offset_seconds"))
     if rows:
         report = format_finish_workout(
@@ -753,7 +873,6 @@ async def _show_workout_categories(
     db_user_id: int,
     telegram_id: int,
     *,
-    edit: bool = False,
     header: str | None = None,
 ) -> None:
     """
@@ -764,7 +883,6 @@ async def _show_workout_categories(
         state: контекст FSM
         db_user_id: внутренний id пользователя
         telegram_id: Telegram id для лога FSM
-        edit: редактировать сообщение (True) или отправить новое
         header: необязательный заголовок вместо стандартного
     """
     categories = await db.get_categories_by_user_id(db_user_id)
@@ -772,12 +890,11 @@ async def _show_workout_categories(
     keyboard = workout_categories_keyboard(categories)
 
     if isinstance(target, CallbackQuery):
-        if edit:
-            await target.message.edit_text(text, reply_markup=keyboard)
-        else:
-            await target.message.answer(text, reply_markup=keyboard)
+        await target.message.edit_text(text, reply_markup=keyboard)
+        await store_screen_message(state, target.message)
     else:
-        await target.answer(text, reply_markup=keyboard)
+        sent = await target.answer(text, reply_markup=keyboard)
+        await store_screen_message(state, sent)
 
     await _transition_state(state, telegram_id, WorkoutStates.choosing_exercise)
 
@@ -789,7 +906,6 @@ async def _show_category_exercises(
     telegram_id: int,
     *,
     category_id: int | None,
-    edit: bool = False,
 ) -> None:
     """
     Показывает упражнения выбранной категории или несортированные.
@@ -828,12 +944,11 @@ async def _show_category_exercises(
     keyboard = workout_exercises_keyboard(catalog)
 
     if isinstance(target, CallbackQuery):
-        if edit:
-            await target.message.edit_text(text, reply_markup=keyboard)
-        else:
-            await target.message.answer(text, reply_markup=keyboard)
+        await target.message.edit_text(text, reply_markup=keyboard)
+        await store_screen_message(state, target.message)
     else:
-        await target.answer(text, reply_markup=keyboard)
+        sent = await target.answer(text, reply_markup=keyboard)
+        await store_screen_message(state, sent)
 
     await _transition_state(state, telegram_id, WorkoutStates.choosing_exercise)
 
@@ -885,14 +1000,16 @@ async def _start_workout_exercise(
         is_new_set=False,
         set_id=None,
     )
+    await _merge_previous_sets_for_exercise(state, exercise_name, exercise_type)
     await _transition_state(state, telegram_id, WorkoutStates.waiting_for_set_value)
 
     data = await state.get_data()
     prompt = _build_set_prompt(data, 1)
     if isinstance(callback, CallbackQuery):
         await callback.message.edit_text(prompt)
+        await store_screen_message(state, callback.message)
     else:
-        await callback.answer(prompt)
+        await show_screen_message(callback, state, prompt)
 
 
 async def _resolve_db_user_id(
@@ -954,7 +1071,6 @@ async def _go_to_exercise_picker(
             db_user_id,
             callback.from_user.id,
             category_id=browse_category_id,
-            edit=True,
         )
     else:
         header = (
@@ -967,7 +1083,6 @@ async def _go_to_exercise_picker(
             state,
             db_user_id,
             callback.from_user.id,
-            edit=True,
             header=header,
         )
 
@@ -997,6 +1112,7 @@ async def _start_next_preset_exercise(
             "Вы можете завершить тренировку или продолжить в свободном режиме.",
             reply_markup=preset_program_complete_keyboard(),
         )
+        await store_screen_message(state, callback.message)
         return False
 
     exercise = preset_queue[preset_index]
@@ -1060,8 +1176,13 @@ async def start_workout(message: Message, state: FSMContext) -> None:
         return
 
     logger.info("Пустая тренировка начата: user_id=%s workout_id=%s", user_id, workout_id)
-    await message.answer("🏋️ Тренировка начата!", reply_markup=main_menu_keyboard())
-    await _show_workout_categories(message, state, user["id"], user_id)
+    await _show_workout_categories(
+        message,
+        state,
+        user["id"],
+        user_id,
+        header="🏋️ Тренировка начата!\n\nВыберите категорию упражнений:",
+    )
 
 
 @router.callback_query(F.data == "workout:start:empty")
@@ -1091,8 +1212,13 @@ async def start_empty_workout(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.answer("Ошибка старта тренировки", show_alert=True)
         return
 
-    await callback.message.edit_text("🏋️ Пустая тренировка начата!")
-    await _show_workout_categories(callback, state, user["id"], callback.from_user.id)
+    await _show_workout_categories(
+        callback,
+        state,
+        user["id"],
+        callback.from_user.id,
+        header="🏋️ Тренировка начата!\n\nВыберите категорию упражнений:",
+    )
     await callback.answer()
 
 
@@ -1205,7 +1331,6 @@ async def back_to_categories(callback: CallbackQuery, state: FSMContext) -> None
         state,
         data["db_user_id"],
         callback.from_user.id,
-        edit=True,
     )
     await callback.answer()
 
@@ -1228,7 +1353,6 @@ async def open_workout_category(callback: CallbackQuery, state: FSMContext) -> N
         data["db_user_id"],
         callback.from_user.id,
         category_id=category_id,
-        edit=True,
     )
     await callback.answer()
 
@@ -1250,7 +1374,6 @@ async def open_unsorted_exercises(callback: CallbackQuery, state: FSMContext) ->
         data["db_user_id"],
         callback.from_user.id,
         category_id=None,
-        edit=True,
     )
     await callback.answer()
 
@@ -1292,6 +1415,10 @@ async def process_exercise_name(message: Message, state: FSMContext) -> None:
         message: текстовое сообщение с названием
         state: контекст FSM создания упражнения
     """
+    data = await state.get_data()
+    if data.get("settings_shortcut_create"):
+        return
+
     name = (message.text or "").strip()
     if not name or len(name) > 100:
         await message.answer("Введите название от 1 до 100 символов:")
@@ -1502,7 +1629,8 @@ async def _send_next_set_prompt(
         WorkoutStates.waiting_for_set_value,
     )
     prompt = _build_set_prompt(data, set_number)
-    await message.answer(prompt)
+    await message.edit_text(prompt)
+    await store_screen_message(state, message)
 
 
 @router.callback_query(F.data == "set:next_set_step")
@@ -1572,10 +1700,11 @@ async def add_more_set(callback: CallbackQuery, state: FSMContext) -> None:
     planned = int(data.get("planned_sets_count") or 0)
 
     if planned > 0 and set_number > planned:
-        await callback.message.answer(
+        await callback.message.edit_text(
             "Вы уверены, что хотите отойти от программы?",
             reply_markup=extra_set_confirm_keyboard(),
         )
+        await store_screen_message(state, callback.message)
         await callback.answer()
         return
 
@@ -1654,9 +1783,10 @@ async def edit_last_set(callback: CallbackQuery, state: FSMContext) -> None:
 
     data = await state.get_data()
     prompt = _build_set_prompt(data, deleted_set_number)
-    await callback.message.answer(
+    await callback.message.edit_text(
         f"Подход {deleted_set_number} удалён. Введите данные заново:\n\n{prompt}"
     )
+    await store_screen_message(state, callback.message)
     await callback.answer()
 
 
@@ -1699,9 +1829,11 @@ async def process_set(message: Message, state: FSMContext) -> None:
         values,
         planned_sets=planned_sets,
     )
-    await message.answer(
+    await show_screen_message(
+        message,
+        state,
         f"{result_text}\n\nЧто дальше?",
-        reply_markup=_after_set_keyboard(data),
+        _after_set_keyboard(data),
     )
 
 
@@ -1883,9 +2015,11 @@ async def template_save_new_finish(message: Message, state: FSMContext) -> None:
 
     report, keyboard = await _build_finish_report(workout_id, data, rows)
     await state.clear()
-    await message.answer(
+    await show_screen_message(
+        message,
+        state,
         f"✅ Шаблон <b>{name}</b> сохранён! Упражнений: {len(exercises)}\n\n{report}",
-        reply_markup=keyboard,
+        keyboard,
     )
 
 
@@ -1911,9 +2045,10 @@ async def save_preset_start(callback: CallbackQuery, state: FSMContext) -> None:
 
     await state.set_state(PresetSaveStates.waiting_for_name)
     await state.update_data(save_workout_id=workout_id)
-    await callback.message.answer(
+    await callback.message.edit_text(
         "Введите название для этой тренировки (например, День Ног):"
     )
+    await store_screen_message(state, callback.message)
     await callback.answer()
 
 
@@ -1957,7 +2092,9 @@ async def save_preset_finish(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await message.answer(
+    await show_screen_message(
+        message,
+        state,
         f"✅ Программа <b>{name}</b> сохранена!\n"
-        f"Упражнений в шаблоне: {len(exercises)}"
+        f"Упражнений в шаблоне: {len(exercises)}",
     )

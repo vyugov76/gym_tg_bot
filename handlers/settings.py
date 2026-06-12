@@ -7,7 +7,7 @@ settings - настройки аккаунта и конструктора
 Ключевые обработчики:
 - show_settings, settings_back - меню настроек
 - show_profile, edit_height_start, edit_weight_start - профиль
-- show_categories, view_category, delete_category - категории
+- show_categories, view_category, rename_category, delete_category - категории
 - show_presets, create_preset_start, view_preset, delete_preset - шаблоны
 - bulk_toggle, bulk_confirm, bulk_cancel - массовый выбор упражнений
 - preset_edit_sets_start, preset_edit_sets_apply - редактирование подходов шаблона
@@ -20,10 +20,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 import database.requests as db
+from handlers.exercises import build_exercises_view_content
 from keyboards.bulk_select import bulk_select_keyboard
 from keyboards.menu import (
     categories_list_keyboard,
-    category_detail_keyboard,
     my_exercises_keyboard,
     preset_detail_keyboard,
     presets_list_keyboard,
@@ -39,6 +39,7 @@ from states.workout_states import (
     TemplateEditStates,
 )
 from utils.preset_helpers import format_preset_exercises_list, parse_sets_count_input
+from utils.screen_message import show_screen_callback, show_screen_message, store_screen_message
 
 router = Router(name="settings")
 logger = logging.getLogger(__name__)
@@ -55,6 +56,25 @@ def _format_preset_exercises(exercises: list[dict]) -> str:
         Многострочный текст со списком упражнений и числом подходов
     """
     return format_preset_exercises_list(exercises)
+
+
+def _profile_text(user: dict) -> str:
+    """
+    Формирует текст экрана профиля пользователя.
+
+    Параметры:
+        user: запись пользователя из БД
+
+    Возвращает:
+        HTML-текст с ростом, весом и датой регистрации
+    """
+    return (
+        f"👤 <b>Ваш профиль</b>\n\n"
+        f"Рост: {user['height']} см\n"
+        f"Вес: {user['weight']} кг\n"
+        f"Дата регистрации: {user['created_at'].strftime('%d.%m.%Y')}"
+    )
+
 
 async def _build_preset_add_queue(
     exercise_ids: list[int],
@@ -109,8 +129,9 @@ async def _prompt_preset_add_sets_count(
     )
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text)
+        await store_screen_message(state, target.message)
     else:
-        await target.answer(text)
+        await show_screen_message(target, state, text)
 
 
 def _format_template_edit_list(exercises: list[dict]) -> str:
@@ -163,9 +184,9 @@ async def _show_template_edit_selection(
     keyboard = template_edit_sets_keyboard(preset_id, exercises)
 
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=keyboard)
+        await show_screen_callback(target, state, text, keyboard)
     else:
-        await target.answer(text, reply_markup=keyboard)
+        await show_screen_message(target, state, text, keyboard)
 
 
 async def _begin_template_edit_sets_count(
@@ -207,9 +228,10 @@ async def _begin_template_edit_sets_count(
     )
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(prompt)
+        await store_screen_message(state, target.message)
         await target.answer()
     else:
-        await target.answer(prompt)
+        await show_screen_message(target, state, prompt)
 
 
 async def _render_category_view(
@@ -242,22 +264,18 @@ async def _render_category_view(
         bulk_selected_ids=[],
     )
 
-    text = f"📂 <b>{category['name']}</b>\n\nУпражнения в категории ({len(exercises)}):"
-    if notice:
-        text = f"{notice}\n\n{text}"
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=my_exercises_keyboard(exercises),
+    text, markup = build_exercises_view_content(
+        category_id,
+        category["name"],
+        exercises,
+        notice=notice,
     )
-    await callback.message.answer(
-        "Действия с категорией:",
-        reply_markup=category_detail_keyboard(category_id),
-    )
+    await show_screen_callback(callback, state, text, markup)
 
 
 async def _render_preset_view(
     target: CallbackQuery | Message,
+    state: FSMContext,
     preset_id: int,
     id_user: int,
     *,
@@ -283,16 +301,11 @@ async def _render_preset_view(
     if notice:
         text = f"{notice}\n\n{text}"
 
+    markup = preset_detail_keyboard(preset_id)
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(
-            text,
-            reply_markup=preset_detail_keyboard(preset_id),
-        )
+        await show_screen_callback(target, state, text, markup)
     else:
-        await target.answer(
-            text,
-            reply_markup=preset_detail_keyboard(preset_id),
-        )
+        await show_screen_message(target, state, text, markup)
 
 
 async def _load_bulk_exercises(
@@ -395,9 +408,11 @@ async def settings_back(callback: CallbackQuery, state: FSMContext) -> None:
         state: контекст FSM, сбрасывается
     """
     await state.clear()
-    await callback.message.edit_text(
+    await show_screen_callback(
+        callback,
+        state,
         "Настройки аккаунта и конструктора:",
-        reply_markup=settings_menu_keyboard(),
+        settings_menu_keyboard(),
     )
     await callback.answer()
 
@@ -420,12 +435,11 @@ async def show_profile(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Сначала нажмите /start", show_alert=True)
         return
 
-    await callback.message.edit_text(
-        f"👤 <b>Ваш профиль</b>\n\n"
-        f"Рост: {user['height']} см\n"
-        f"Вес: {user['weight']} кг\n"
-        f"Дата регистрации: {user['created_at'].strftime('%d.%m.%Y')}",
-        reply_markup=profile_keyboard(),
+    await show_screen_callback(
+        callback,
+        state,
+        _profile_text(user),
+        profile_keyboard(),
     )
     await callback.answer()
 
@@ -443,6 +457,7 @@ async def edit_height_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         "Введите новый <b>рост в см</b> (от 100 до 250):"
     )
+    await store_screen_message(state, callback.message)
     await callback.answer()
 
 
@@ -459,6 +474,7 @@ async def edit_weight_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         "Введите новый <b>вес в кг</b> (от 30 до 300):"
     )
+    await store_screen_message(state, callback.message)
     await callback.answer()
 
 
@@ -493,9 +509,12 @@ async def edit_height_finish(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await message.answer(
-        f"✅ Рост обновлён: <b>{height} см</b>",
-        reply_markup=profile_keyboard(),
+    user = await db.get_user_by_telegram_id(message.from_user.id)
+    await show_screen_message(
+        message,
+        state,
+        f"✅ Рост обновлён: <b>{height} см</b>\n\n{_profile_text(user)}",
+        profile_keyboard(),
     )
 
 
@@ -530,9 +549,12 @@ async def edit_weight_finish(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await message.answer(
-        f"✅ Вес обновлён: <b>{weight} кг</b>",
-        reply_markup=profile_keyboard(),
+    user = await db.get_user_by_telegram_id(message.from_user.id)
+    await show_screen_message(
+        message,
+        state,
+        f"✅ Вес обновлён: <b>{weight} кг</b>\n\n{_profile_text(user)}",
+        profile_keyboard(),
     )
 
 
@@ -561,9 +583,11 @@ async def show_categories(callback: CallbackQuery, state: FSMContext) -> None:
         if categories
         else "📂 <b>Упражнения</b>\n\nУ вас пока нет категорий."
     )
-    await callback.message.edit_text(
+    await show_screen_callback(
+        callback,
+        state,
         text,
-        reply_markup=categories_list_keyboard(categories),
+        categories_list_keyboard(categories),
     )
     await callback.answer()
 
@@ -581,6 +605,7 @@ async def create_category_start(callback: CallbackQuery, state: FSMContext) -> N
     await callback.message.edit_text(
         "Введите <b>название категории</b> (например, Грудь):"
     )
+    await store_screen_message(state, callback.message)
     await callback.answer()
 
 
@@ -613,10 +638,11 @@ async def create_category_finish(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await message.answer(
-        f"✅ Категория <b>{name}</b> создана!\n\n"
-        f"📂 <b>Категории упражнений</b>",
-        reply_markup=categories_list_keyboard(categories),
+    await show_screen_message(
+        message,
+        state,
+        f"✅ Категория <b>{name}</b> создана!\n\n📂 <b>Категории упражнений</b>",
+        categories_list_keyboard(categories),
     )
 
 
@@ -637,16 +663,8 @@ async def view_unsorted_exercises(callback: CallbackQuery, state: FSMContext) ->
     exercises = await db.get_unsorted_exercises(user["id"])
     await state.update_data(settings_category_id=None, settings_category_name=None)
 
-    await callback.message.edit_text(
-        f"📁 <b>Несортированные</b>\n\nУпражнения ({len(exercises)}):",
-        reply_markup=my_exercises_keyboard(exercises),
-    )
-    await callback.message.answer(
-        "◀️ Вернуться к категориям:",
-        reply_markup=categories_list_keyboard(
-            await db.get_categories_by_user_id(user["id"])
-        ),
-    )
+    text, markup = build_exercises_view_content(None, None, exercises)
+    await show_screen_callback(callback, state, text, markup)
     await callback.answer()
 
 
@@ -676,19 +694,113 @@ async def view_category(callback: CallbackQuery, state: FSMContext) -> None:
         settings_category_name=category["name"],
     )
 
-    text = (
-        f"📂 <b>{category['name']}</b>\n\n"
-        f"Упражнения в категории ({len(exercises)}):"
+    text, markup = build_exercises_view_content(
+        category_id,
+        category["name"],
+        exercises,
     )
+    await show_screen_callback(callback, state, text, markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cat:rename:"))
+async def rename_category_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """
+    Запрашивает новое название категории упражнений.
+
+    Параметры:
+        callback: inline-кнопка cat:rename:{category_id}
+        state: переводится в CategoryStates.waiting_for_rename
+    """
+    category_id = int(callback.data.split(":")[-1])
+    user = await db.get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала нажмите /start", show_alert=True)
+        return
+
+    category = await db.get_category_by_id(category_id)
+    if not category or category["id_user"] != user["id"]:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+
+    await store_screen_message(state, callback.message)
+    await state.update_data(
+        settings_category_id=category_id,
+        settings_category_name=category["name"],
+        renaming_category_id=category_id,
+    )
+    await state.set_state(CategoryStates.waiting_for_rename)
     await callback.message.edit_text(
-        text,
-        reply_markup=my_exercises_keyboard(exercises),
-    )
-    await callback.message.answer(
-        "Действия с категорией:",
-        reply_markup=category_detail_keyboard(category_id),
+        f"📂 Текущее название: <b>{category['name']}</b>\n\n"
+        "Введите <b>новое название</b> категории:"
     )
     await callback.answer()
+
+
+@router.message(CategoryStates.waiting_for_rename)
+async def rename_category_finish(message: Message, state: FSMContext) -> None:
+    """
+    Сохраняет новое название категории и обновляет экран списка упражнений.
+
+    Параметры:
+        message: текстовое сообщение с новым названием
+        state: контекст FSM с renaming_category_id
+    """
+    name = (message.text or "").strip()
+    if not name or len(name) > 100:
+        await message.answer("Введите название от 1 до 100 символов:")
+        return
+
+    user = await db.get_user_by_telegram_id(message.from_user.id)
+    if not user:
+        await state.clear()
+        await message.answer("Сначала нажмите /start для регистрации.")
+        return
+
+    data = await state.get_data()
+    category_id = data.get("renaming_category_id")
+    if not category_id:
+        await state.clear()
+        await message.answer("Категория не найдена. Откройте категорию заново.")
+        return
+
+    category = await db.get_category_by_id(category_id)
+    if not category or category["id_user"] != user["id"]:
+        await state.clear()
+        await message.answer("Категория не найдена. Откройте категорию заново.")
+        return
+
+    try:
+        await db.update_category_name(category_id, user["id"], name)
+    except Exception:
+        logger.exception(
+            "Ошибка переименования категории: user_id=%s category_id=%s",
+            message.from_user.id,
+            category_id,
+        )
+        await message.answer("Не удалось обновить название. Попробуйте позже.")
+        return
+
+    exercises = await db.get_exercises_by_category(user["id"], category_id)
+    await state.update_data(
+        settings_category_id=category_id,
+        settings_category_name=name,
+        renaming_category_id=None,
+    )
+    await state.set_state(None)
+
+    text, markup = build_exercises_view_content(
+        category_id,
+        name,
+        exercises,
+        notice=f"✅ Категория переименована в <b>{name}</b>",
+    )
+    await show_screen_message(
+        message,
+        state,
+        text,
+        markup,
+    )
 
 
 @router.callback_query(F.data.startswith("cat:delete:"))
@@ -719,10 +831,12 @@ async def delete_category(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await callback.message.edit_text(
+    await show_screen_callback(
+        callback,
+        state,
         "✅ Категория удалена. Упражнения перенесены в «Несортированные».\n\n"
         "📂 <b>Категории упражнений</b>",
-        reply_markup=categories_list_keyboard(categories),
+        categories_list_keyboard(categories),
     )
     await callback.answer()
 
@@ -752,7 +866,12 @@ async def show_presets(callback: CallbackQuery, state: FSMContext) -> None:
         if presets
         else "📋 <b>Мои готовые тренировки</b>\n\nУ вас пока нет сохранённых программ."
     )
-    await callback.message.edit_text(text, reply_markup=presets_list_keyboard(presets))
+    await show_screen_callback(
+        callback,
+        state,
+        text,
+        presets_list_keyboard(presets),
+    )
     await callback.answer()
 
 
@@ -780,6 +899,7 @@ async def create_preset_start(callback: CallbackQuery, state: FSMContext) -> Non
     await callback.message.edit_text(
         "Введите <b>название шаблона</b> (например, Руки/Плечи):"
     )
+    await store_screen_message(state, callback.message)
     await callback.answer()
 
 
@@ -813,6 +933,7 @@ async def create_preset_finish(message: Message, state: FSMContext) -> None:
     await state.clear()
     await _render_preset_view(
         message,
+        state,
         preset_id,
         user["id"],
         notice=f"✅ Шаблон <b>{name}</b> создан!",
@@ -835,7 +956,7 @@ async def view_preset(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.update_data(bulk_selected_ids=[])
-    await _render_preset_view(callback, preset_id, user["id"])
+    await _render_preset_view(callback, state, preset_id, user["id"])
     await callback.answer()
 
 
@@ -867,9 +988,11 @@ async def delete_preset(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await callback.message.edit_text(
+    await show_screen_callback(
+        callback,
+        state,
         "✅ Готовая тренировка удалена.\n\n📋 <b>Мои готовые тренировки</b>",
-        reply_markup=presets_list_keyboard(presets),
+        presets_list_keyboard(presets),
     )
     await callback.answer()
 
@@ -903,6 +1026,7 @@ async def category_bulk_add_start(callback: CallbackQuery, state: FSMContext) ->
         _bulk_title("cat_add", category["name"]),
         reply_markup=bulk_select_keyboard(exercises, [], "cat_add", category_id),
     )
+    await store_screen_message(state, callback.message)
     await callback.answer()
 
 
@@ -932,6 +1056,7 @@ async def category_bulk_remove_start(callback: CallbackQuery, state: FSMContext)
         _bulk_title("cat_rm", category["name"]),
         reply_markup=bulk_select_keyboard(exercises, [], "cat_rm", category_id),
     )
+    await store_screen_message(state, callback.message)
     await callback.answer()
 
 
@@ -1129,6 +1254,7 @@ async def bulk_confirm(callback: CallbackQuery, state: FSMContext) -> None:
             )
             await _render_preset_view(
                 callback,
+                state,
                 context_id,
                 user["id"],
                 notice=f"✅ Удалено из шаблона: {count}",
@@ -1171,7 +1297,7 @@ async def bulk_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     if mode.startswith("cat"):
         await _render_category_view(callback, state, context_id, user["id"])
     else:
-        await _render_preset_view(callback, context_id, user["id"])
+        await _render_preset_view(callback, state, context_id, user["id"])
 
     await callback.answer("Отменено")
 
@@ -1231,6 +1357,7 @@ async def preset_bulk_add_sets_count(message: Message, state: FSMContext) -> Non
     await state.clear()
     await _render_preset_view(
         message,
+        state,
         preset_id,
         user["id"],
         notice=f"✅ Добавлено в шаблон: {len(queue)}",
@@ -1307,7 +1434,7 @@ async def preset_edit_sets_done(callback: CallbackQuery, state: FSMContext) -> N
         return
 
     await state.clear()
-    await _render_preset_view(callback, preset_id, user["id"])
+    await _render_preset_view(callback, state, preset_id, user["id"])
     await callback.answer()
 
 

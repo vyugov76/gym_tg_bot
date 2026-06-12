@@ -140,7 +140,11 @@ def _is_dead_connection_error(exc: BaseException) -> bool:
 
     if isinstance(exc, pyodbc.ProgrammingError):
         text = _error_text(exc)
-        if "connection has been closed" in text or "closed connection" in text:
+        if (
+            "connection has been closed" in text
+            or "closed connection" in text
+            or "cursor's connection has been closed" in text
+        ):
             return True
 
     if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
@@ -193,7 +197,7 @@ async def _pooled_connection() -> AsyncIterator[Any]:
     Возвращает:
         Асинхронный итератор, отдающий соединение aioodbc из пула.
     """
-    pool = get_pool()
+    pool = await get_pool()
     conn = await pool.acquire()
     discard = False
     try:
@@ -753,6 +757,32 @@ async def delete_category(category_id: int, user_id: int) -> None:
     )
 
 
+async def update_category_name(
+    category_id: int,
+    user_id: int,
+    category_name: str,
+) -> None:
+    """
+    Переименовывает категорию пользователя.
+
+    Параметры:
+        category_id: id_category.
+        user_id: Внутренний id_user владельца.
+        category_name: Новое название категории.
+
+    Возвращает:
+        None.
+    """
+    await _run_query(
+        """
+        UPDATE GTB_categories
+        SET category_name = ?
+        WHERE id_category = ? AND id_user = ?
+        """,
+        (category_name, category_id, user_id),
+    )
+
+
 # --- Глобальный каталог упражнений (workout_id IS NULL) ---
 
 
@@ -870,6 +900,32 @@ async def get_exercise_by_id(exercise_id: int) -> dict[str, Any] | None:
         fetch="one",
     )
     return _normalize_exercise_row(row) if row else None
+
+
+async def user_has_catalog_exercise_name(user_id: int, exercise_name: str) -> bool:
+    """
+    Проверяет, есть ли у пользователя упражнение с таким названием в каталоге.
+
+    Параметры:
+        user_id: внутренний id_user
+        exercise_name: название для проверки без учёта регистра
+
+    Возвращает:
+        True, если неудалённое упражнение с таким именем уже существует
+    """
+    found = await _run_query(
+        """
+        SELECT TOP 1 1
+        FROM GTB_workout_exercises
+        WHERE id_user = ?
+          AND workout_id IS NULL
+          AND is_deleted = 0
+          AND LOWER(exercise_name) = LOWER(?)
+        """,
+        (user_id, exercise_name.strip()),
+        fetch="scalar",
+    )
+    return found is not None
 
 
 async def add_global_exercise(
@@ -1540,6 +1596,58 @@ async def get_previous_set_for_exercise(
                 "distance_meters": row.get("distance_meters"),
             }
     return None
+
+
+async def get_previous_workout_sets_for_exercise(
+    user_id: int,
+    exercise_name: str,
+    exercise_type: int,
+    *,
+    exclude_workout_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Возвращает подходы упражнения из последней завершённой тренировки пользователя.
+
+    Ищет последнюю тренировку, где выполнялось это упражнение, независимо от шаблона.
+
+    Параметры:
+        user_id: Внутренний id_user.
+        exercise_name: Название упражнения.
+        exercise_type: Тип упражнения (0, 1 или 2).
+        exclude_workout_id: id_workout для исключения из поиска.
+
+    Возвращает:
+        Строки детализации подходов или пустой список.
+    """
+    exercise_type = _as_exercise_type(exercise_type)
+    exclude_sql = "AND w2.id_workout <> ?" if exclude_workout_id is not None else ""
+    params: list[Any] = [user_id, user_id, exercise_name, exercise_type]
+    if exclude_workout_id is not None:
+        params.append(exclude_workout_id)
+    params.extend([exercise_name, exercise_type])
+
+    where_clause = f"""
+        w.id_user = ?
+        AND w.finished_at IS NOT NULL
+        AND w.id_workout = (
+            SELECT TOP 1 w2.id_workout
+            FROM GTB_workouts w2
+            INNER JOIN GTB_workout_exercises we2 ON we2.workout_id = w2.id_workout
+            WHERE w2.id_user = ?
+              AND w2.finished_at IS NOT NULL
+              AND we2.exercise_name = ?
+              AND we2.is_bodyweight = ?
+              {exclude_sql}
+            ORDER BY w2.finished_at DESC
+        )
+        AND we.exercise_name = ?
+        AND we.is_bodyweight = ?
+    """
+    return await _fetch_workout_detail_rows(
+        where_clause,
+        tuple(params),
+        "we.id_workout_exercise, s.set_number",
+    )
 
 
 async def replace_preset_exercises_from_workout(
